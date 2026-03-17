@@ -10,10 +10,16 @@ let scoreChart = null;
 let gaugeChart = null;
 let radarChart = null;
 let analysisRevealTimeout = null;
+let recordingStream = null;
+let audioContext = null;
+let analyserNode = null;
+let microphoneSource = null;
+let voiceMeterFrame = null;
 
 const startButton = document.getElementById("startRecord");
 const stopButton = document.getElementById("stopRecord");
 const resetButton = document.getElementById("resetHistory");
+const chatContainer = document.getElementById("chatContainer");
 const chatWindow = document.getElementById("chatWindow");
 const recordingIndicator = document.getElementById("recordingIndicator");
 const aiThinking = document.getElementById("aiThinking");
@@ -32,6 +38,8 @@ const analysisScoreEl = document.getElementById("analysisScore");
 const analysisRiskLevelEl = document.getElementById("analysisRiskLevel");
 const analysisTrendEl = document.getElementById("analysisTrend");
 const analysisReasonEl = document.getElementById("analysisReason");
+const analysisStateBadgeEl = document.getElementById("analysisStateBadge");
+const analysisEmptyHintEl = document.getElementById("analysisEmptyHint");
 
 const featureRepetitionValueEl = document.getElementById("featureRepetitionValue");
 const featureMemoryValueEl = document.getElementById("featureMemoryValue");
@@ -55,7 +63,22 @@ const closeWarningPopupButton = document.getElementById("closeWarningPopup");
 
 const processStepOrder = ["capture", "stt", "answer", "analysis", "render"];
 
+function setVoiceLevel(level = 0.06) {
+    const normalizedLevel = Math.max(0.06, Math.min(1, Number(level) || 0.06));
+    document.documentElement.style.setProperty("--voice-level", normalizedLevel.toFixed(3));
+    document.documentElement.style.setProperty("--voice-core-opacity", (0.1 + (normalizedLevel * 0.14)).toFixed(3));
+    document.documentElement.style.setProperty("--voice-halo-opacity", (0.06 + (normalizedLevel * 0.08)).toFixed(3));
+    document.documentElement.style.setProperty("--voice-wave-opacity", (0.08 + (normalizedLevel * 0.16)).toFixed(3));
+    document.documentElement.style.setProperty("--voice-wave-back-scale", (0.94 + (normalizedLevel * 0.14)).toFixed(3));
+    document.documentElement.style.setProperty("--voice-wave-back-peak", (1 + (normalizedLevel * 0.22)).toFixed(3));
+    document.documentElement.style.setProperty("--voice-wave-mid-scale", (1 + (normalizedLevel * 0.18)).toFixed(3));
+    document.documentElement.style.setProperty("--voice-wave-mid-peak", (1.06 + (normalizedLevel * 0.28)).toFixed(3));
+    document.documentElement.style.setProperty("--voice-wave-front-scale", (1.02 + (normalizedLevel * 0.22)).toFixed(3));
+    document.documentElement.style.setProperty("--voice-wave-front-peak", (1.08 + (normalizedLevel * 0.34)).toFixed(3));
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
+    setVoiceLevel(0.06);
     bindEvents();
     resetProcessState("대기 중");
     await loadScoreHistory();
@@ -66,6 +89,33 @@ function bindEvents() {
     if (stopButton) stopButton.onclick = stopRecording;
     if (resetButton) resetButton.onclick = resetHistory;
     if (closeWarningPopupButton) closeWarningPopupButton.onclick = hideWarningPopup;
+}
+
+function renderChatEmptyState() {
+    if (!chatWindow) {
+        return;
+    }
+
+    chatWindow.innerHTML = "";
+
+    const emptyState = document.createElement("div");
+    emptyState.className = "chat-empty-state";
+    emptyState.id = "chatEmptyState";
+    emptyState.innerHTML = `
+        <div class="chat-empty-kicker">Ready For Analysis</div>
+        <h4>아직 대화 기록이 없습니다.</h4>
+        <p>녹음을 시작하면 답변과 위험도 분석이 이곳에 차례대로 표시됩니다.</p>
+        <p>대화가 쌓이면 메시지를 클릭해 해당 시점의 분석 결과를 다시 볼 수 있습니다.</p>
+    `;
+
+    chatWindow.appendChild(emptyState);
+}
+
+function clearChatEmptyState() {
+    const emptyState = document.getElementById("chatEmptyState");
+    if (emptyState) {
+        emptyState.remove();
+    }
 }
 
 function setThinkingMessage(text) {
@@ -127,6 +177,8 @@ function resetProcessState(detail = "대기 중") {
 async function startRecording() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recordingStream = stream;
+        await startVoiceAmbient(stream);
 
         mediaRecorder = new MediaRecorder(stream);
 
@@ -263,7 +315,14 @@ function stopRecording() {
         return;
     }
 
+    if (mediaRecorder.state === "inactive") {
+        return;
+    }
+
     mediaRecorder.stop();
+    setRecordingState(false);
+    cleanupRecordingStream();
+    stopVoiceAmbient();
 }
 
 async function resetHistory() {
@@ -290,6 +349,7 @@ async function resetHistory() {
             chatWindow.innerHTML = "";
         }
 
+        renderChatEmptyState();
         resetAnalysisCard();
         updateFeatureBreakdown({});
         updateRecallCard(data.recall || {});
@@ -303,7 +363,90 @@ async function resetHistory() {
     }
 }
 
+function cleanupRecordingStream() {
+    if (!recordingStream) {
+        return;
+    }
+
+    recordingStream.getTracks().forEach((track) => track.stop());
+    recordingStream = null;
+}
+
+function stopVoiceAmbient(resetLevel = true) {
+    if (voiceMeterFrame) {
+        cancelAnimationFrame(voiceMeterFrame);
+        voiceMeterFrame = null;
+    }
+
+    if (microphoneSource) {
+        microphoneSource.disconnect();
+        microphoneSource = null;
+    }
+
+    analyserNode = null;
+
+    if (audioContext) {
+        audioContext.close().catch(() => {});
+        audioContext = null;
+    }
+
+    if (resetLevel) {
+        setVoiceLevel(0.06);
+    }
+}
+
+async function startVoiceAmbient(stream) {
+    stopVoiceAmbient(false);
+    setVoiceLevel(0.14);
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+        return;
+    }
+
+    audioContext = new AudioContextClass();
+
+    if (audioContext.state === "suspended") {
+        await audioContext.resume();
+    }
+
+    analyserNode = audioContext.createAnalyser();
+    analyserNode.fftSize = 256;
+    analyserNode.smoothingTimeConstant = 0.84;
+
+    microphoneSource = audioContext.createMediaStreamSource(stream);
+    microphoneSource.connect(analyserNode);
+
+    const timeDomainData = new Uint8Array(analyserNode.frequencyBinCount);
+
+    const tick = () => {
+        if (!analyserNode) {
+            return;
+        }
+
+        analyserNode.getByteTimeDomainData(timeDomainData);
+
+        let sum = 0;
+        for (let index = 0; index < timeDomainData.length; index += 1) {
+            const centered = (timeDomainData[index] - 128) / 128;
+            sum += centered * centered;
+        }
+
+        const rms = Math.sqrt(sum / timeDomainData.length);
+        const nextLevel = Math.min(1, 0.08 + (rms * 6.2));
+        setVoiceLevel(nextLevel);
+        voiceMeterFrame = requestAnimationFrame(tick);
+    };
+
+    tick();
+}
+
 function setRecordingState(isRecording) {
+    document.body.classList.toggle("is-recording", isRecording);
+    if (chatContainer) {
+        chatContainer.classList.toggle("is-recording", isRecording);
+    }
+
     if (isRecording) {
         if (startButton) startButton.disabled = true;
         if (stopButton) stopButton.disabled = false;
@@ -381,6 +524,8 @@ function appendChatMessage(type, text, options = {}) {
         return null;
     }
 
+    clearChatEmptyState();
+
     const message = document.createElement("div");
     message.classList.add("message", "message-enter");
 
@@ -390,7 +535,22 @@ function appendChatMessage(type, text, options = {}) {
         message.classList.add("system-message");
     }
 
-    message.innerText = text;
+    const content = document.createElement("div");
+    content.className = "message-content";
+    content.innerText = text;
+    message.appendChild(content);
+
+    if (options.badge) {
+        const meta = document.createElement("div");
+        meta.className = "message-meta";
+
+        const badge = document.createElement("span");
+        badge.className = "message-badge";
+        badge.innerText = options.badge;
+
+        meta.appendChild(badge);
+        message.appendChild(meta);
+    }
 
     if (options.turnId) {
         message.dataset.turnId = options.turnId;
@@ -410,6 +570,7 @@ function appendLoadingMessage(text = "답변 생성 중...") {
         return;
     }
 
+    clearChatEmptyState();
     removeLoadingMessage();
 
     const message = document.createElement("div");
@@ -456,6 +617,9 @@ async function loadScoreHistory() {
 
         if (turnHistory.length > 0) {
             renderTurnHistory(turnHistory);
+        } else {
+            renderChatEmptyState();
+            resetAnalysisCard();
         }
     } catch (error) {
         console.error("점수 기록 로딩 실패:", error);
@@ -466,11 +630,26 @@ async function loadScoreHistory() {
             trend: "데이터 부족",
             score_history: []
         });
+        renderChatEmptyState();
+        resetAnalysisCard();
     }
 }
 
 function isScoreIncluded(data) {
     return data?.score_included !== false;
+}
+
+function setAnalysisStateBadge(label, tone = "idle", hintText = "") {
+    if (analysisStateBadgeEl) {
+        analysisStateBadgeEl.innerText = label;
+        analysisStateBadgeEl.classList.remove("is-idle", "is-complete", "is-warning", "is-excluded");
+        analysisStateBadgeEl.classList.add(`is-${tone}`);
+    }
+
+    if (analysisEmptyHintEl) {
+        analysisEmptyHintEl.innerText = hintText;
+        analysisEmptyHintEl.classList.toggle("is-hidden", !hintText);
+    }
 }
 
 function setAnalysisScoreDisplay(score, scoreIncluded = true) {
@@ -488,20 +667,39 @@ function updateAnalysisCard(data) {
     const reasonText = scoreIncluded
         ? (data.reason || "분석 근거가 없습니다.")
         : (data.excluded_reason || data.reason || "이번 분석은 점수 통계에서 제외되었습니다.");
+    const badgeLabel = !scoreIncluded
+        ? "점수 미반영"
+        : data.judgment === "의심"
+            ? "주의 관찰"
+            : "분석 완료";
+    const badgeTone = !scoreIncluded
+        ? "excluded"
+        : data.judgment === "의심"
+            ? "warning"
+            : "complete";
+    const hintText = !scoreIncluded
+        ? (data.excluded_reason || "이번 분석은 평균과 추세 계산에서 제외되었습니다.")
+        : "채팅 기록을 클릭하면 해당 시점의 분석 결과를 다시 볼 수 있습니다.";
 
     if (analysisJudgmentEl) analysisJudgmentEl.innerText = data.judgment || "없음";
     if (analysisRiskLevelEl) analysisRiskLevelEl.innerText = riskLabel;
     if (analysisTrendEl) analysisTrendEl.innerText = trendLabel;
     if (analysisReasonEl) analysisReasonEl.innerText = reasonText;
+    setAnalysisStateBadge(badgeLabel, badgeTone, hintText);
 }
 
 function resetAnalysisCard() {
-    if (analysisJudgmentEl) analysisJudgmentEl.innerText = "없음";
-    if (analysisScoreEl) analysisScoreEl.innerText = "0";
-    if (analysisRiskLevelEl) analysisRiskLevelEl.innerText = "Normal";
-    if (analysisTrendEl) analysisTrendEl.innerText = "데이터 부족";
-    if (analysisReasonEl) analysisReasonEl.innerText = "아직 분석 결과가 없습니다.";
+    if (analysisJudgmentEl) analysisJudgmentEl.innerText = "대기";
+    if (analysisScoreEl) analysisScoreEl.innerText = "-";
+    if (analysisRiskLevelEl) analysisRiskLevelEl.innerText = "분석 전";
+    if (analysisTrendEl) analysisTrendEl.innerText = "-";
+    if (analysisReasonEl) analysisReasonEl.innerText = "아직 분석 결과가 없습니다. 녹음을 시작하면 이곳에 판단 근거가 표시됩니다.";
     if (confidenceScoreEl) confidenceScoreEl.innerText = "-";
+    setAnalysisStateBadge(
+        "대기",
+        "idle",
+        "아직 분석 전입니다. 대화를 시작하면 판단, 점수, 근거가 이곳에 표시됩니다."
+    );
 }
 
 function setSelectedMessageState(turnId) {
@@ -561,8 +759,17 @@ function renderTurnHistory(turns) {
 
     chatWindow.innerHTML = "";
 
+    if (!Array.isArray(turns) || turns.length === 0) {
+        renderChatEmptyState();
+        resetAnalysisCard();
+        return;
+    }
+
     turns.forEach((turn) => {
-        appendChatMessage("user", turn.user_text || "", { turnId: turn.turn_id });
+        appendChatMessage("user", turn.user_text || "", {
+            turnId: turn.turn_id,
+            badge: turn.score_included === false ? "점수 미반영" : ""
+        });
         appendChatMessage("system", turn.answer || "", { turnId: turn.turn_id });
 
         if (Array.isArray(turn.follow_up_messages)) {
@@ -1169,6 +1376,8 @@ async function handleRecognizedTextFlow(recognizedText) {
 async function startRecording() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recordingStream = stream;
+        await startVoiceAmbient(stream);
 
         mediaRecorder = new MediaRecorder(stream);
 
@@ -1203,8 +1412,8 @@ async function startRecording() {
 
                 if (sttData.error) {
                     appendChatMessage("system", sttData.error);
-                    setSystemState("?ㅻ쪟 諛쒖깮");
-                    setProcessError("?뚯꽦 ?몄떇 以?臾몄젣媛 諛쒖깮?덉뒿?덈떎.");
+                    setSystemState("오류 발생");
+                    setProcessError("음성 인식 중 문제가 발생했습니다.");
                     setAnalysisThinking(false);
                     setAnalysisLoadingState(false);
                     return;
@@ -1218,9 +1427,9 @@ async function startRecording() {
                 const recognizedText = normalizeText(sttData.user_speech || "");
 
                 if (!recognizedText) {
-                    appendChatMessage("system", "?뚯꽦 ?몄떇 寃곌낵媛 ?놁뒿?덈떎. ?ㅼ떆 ?뱀쓬??二쇱꽭??");
-                    setSystemState("?뚯꽦 ?몄떇 ?ㅽ뙣");
-                    setProcessError("?몄떇??臾몄옄媛 ?놁뼱 ?ㅼ쓬 ?④퀎濡??ㅽ뻾?븷 ???놁뒿?덈떎.");
+                    appendChatMessage("system", "음성 인식 결과가 없습니다. 다시 녹음해 주세요.");
+                    setSystemState("음성 인식 실패");
+                    setProcessError("인식된 문자가 없어 다음 단계로 진행할 수 없습니다.");
                     setAnalysisThinking(false);
                     setAnalysisLoadingState(false);
                     return;
@@ -1230,13 +1439,16 @@ async function startRecording() {
             } catch (error) {
                 console.error(error);
                 removeLoadingMessage();
-                appendChatMessage("system", "?ㅻ쪟媛 諛쒖깮?덉뒿?덈떎. ?ㅼ떆 ?쒕룄?댁＜?몄슂.");
-                setSystemState("?ㅻ쪟 諛쒖깮");
-                setProcessError("?쟾泥?泥섎━ ?좏젙?먯꽌 ?덈쇅媛 諛쒖깮?덉뒿?덈떎.");
+                appendChatMessage("system", "오류가 발생했습니다. 다시 시도해 주세요.");
+                setSystemState("오류 발생");
+                setProcessError("전체 처리 과정에서 예외가 발생했습니다.");
                 setAnalysisThinking(false);
                 setAnalysisLoadingState(false);
             } finally {
                 audioChunks = [];
+                mediaRecorder = null;
+                cleanupRecordingStream();
+                stopVoiceAmbient();
             }
         };
 
@@ -1246,6 +1458,9 @@ async function startRecording() {
         setProcessState("capture", "사용자 음성을 수집하고 있습니다.");
     } catch (error) {
         console.error(error);
-        alert("留덉씠???묎렐???ㅽ뙣?덉뒿?덈떎.");
+        cleanupRecordingStream();
+        stopVoiceAmbient();
+        setRecordingState(false);
+        alert("마이크 접근 권한 요청에 실패했습니다.");
     }
 }

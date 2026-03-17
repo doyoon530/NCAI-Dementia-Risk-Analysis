@@ -362,7 +362,12 @@ http://192.168.0.15:5000
 HOST=0.0.0.0
 PORT=5000
 WAITRESS_THREADS=8
+ANALYSIS_N_CTX=8192
+ANALYSIS_N_BATCH=512
+ANALYSIS_MAX_TOKENS=384
 ```
+
+분석용 LLM만 더 넓은 문맥과 배치를 사용하도록 분리했다. 답변용 모델은 기존 설정을 유지한다. 메모리 사용량이 부담되면 `ANALYSIS_N_CTX` 또는 `ANALYSIS_N_BATCH`를 낮춰 조절할 수 있다.
 
 ### 10.4 접속 주소
 

@@ -42,6 +42,9 @@ Optional:
 
 ```text
 MODEL_DOWNLOAD_URL=https://...
+ANALYSIS_N_CTX=8192
+ANALYSIS_N_BATCH=512
+ANALYSIS_MAX_TOKENS=384
 ```
 
 If `MODEL_DOWNLOAD_URL` is set and `MODEL_PATH` does not exist, the container startup script downloads the model file automatically.

@@ -447,7 +447,9 @@ def add_turn_history(
     score: int,
     reason: str,
     feature_scores: dict,
-    follow_up_messages=None
+    follow_up_messages=None,
+    score_included: bool = True,
+    excluded_reason: str = ""
 ) -> dict:
     turn_store.setdefault(session_id, [])
 
@@ -466,6 +468,8 @@ def add_turn_history(
             "incoherence": int(feature_scores.get("incoherence", 0))
         },
         "follow_up_messages": follow_up_messages or [],
+        "score_included": bool(score_included),
+        "excluded_reason": str(excluded_reason or ""),
     }
 
     turn_store[session_id].append(turn)
@@ -473,16 +477,130 @@ def add_turn_history(
     if len(turn_store[session_id]) > MAX_SCORE_HISTORY:
         turn_store[session_id] = turn_store[session_id][-MAX_SCORE_HISTORY:]
 
-    turn["risk_level"] = get_risk_level_from_score(turn["score"])
-    turn["trend"] = get_score_trend(session_id)
     turn["average_score"] = get_average_score(session_id)
     turn["recent_average_score"] = get_recent_average_score(session_id)
-    turn["confidence"] = calculate_confidence_from_feature_scores(turn["feature_scores"], turn["score"])
+
+    if turn["score_included"]:
+        turn["risk_level"] = get_risk_level_from_score(turn["score"])
+        turn["trend"] = get_score_trend(session_id)
+        turn["confidence"] = calculate_confidence_from_feature_scores(turn["feature_scores"], turn["score"])
+    else:
+        turn["risk_level"] = "반영 제외"
+        turn["trend"] = "반영 제외"
+        turn["confidence"] = 0
 
     return turn
 
 
+def calculate_trend_from_score_values(scores, window: int = RECENT_WINDOW) -> str:
+    if len(scores) < 2:
+        return "데이터 부족"
+
+    recent = scores[-window:]
+    if len(recent) < 2:
+        return "안정"
+
+    diff = recent[-1] - recent[0]
+
+    if diff >= 10:
+        return "상승"
+    if diff <= -10:
+        return "하락"
+    return "안정"
+
+
+def repair_session_analysis_history(session_id: str) -> None:
+    turns = turn_store.get(session_id, [])
+    if not turns:
+        return
+
+    existing_scores = score_store.get(session_id, [])
+    running_scores = []
+
+    for turn in turns:
+        feature_scores = turn.get("feature_scores") or {}
+        repaired_feature_scores = {
+            "repetition": clamp_subscore(int(feature_scores.get("repetition", 0)), 25),
+            "memory": clamp_subscore(int(feature_scores.get("memory", 0)), 25),
+            "time_confusion": clamp_subscore(int(feature_scores.get("time_confusion", 0)), 30),
+            "incoherence": clamp_subscore(int(feature_scores.get("incoherence", 0)), 20),
+        }
+
+        current_score = clamp_score(int(turn.get("score", 0)))
+        current_subtotal = sum(repaired_feature_scores.values())
+        parsed_from_reason = parse_analysis_scores(turn.get("reason", ""))
+        score_included = turn.get("score_included")
+        if score_included is None:
+            score_included = should_include_analysis_score(turn.get("judgment", ""), current_score, repaired_feature_scores)
+        score_included = bool(score_included)
+
+        if score_included and parsed_from_reason["total"] > 0 and (current_score == 0 or current_subtotal == 0):
+            repaired_feature_scores = {
+                "repetition": parsed_from_reason["repetition"],
+                "memory": parsed_from_reason["memory"],
+                "time_confusion": parsed_from_reason["time_confusion"],
+                "incoherence": parsed_from_reason["incoherence"],
+            }
+            current_score = parsed_from_reason["total"]
+        elif score_included and current_subtotal > 0 and current_score != clamp_score(current_subtotal):
+            current_score = clamp_score(current_subtotal)
+
+        judgment = str(turn.get("judgment", "")).strip()
+        if judgment not in {"정상", "의심", "판단 어려움"}:
+            judgment = infer_judgment_from_score(current_score)
+        if score_included and ((judgment == "정상" and current_score >= 20) or (judgment == "의심" and current_score < 20)):
+            judgment = infer_judgment_from_score(current_score)
+
+        turn["feature_scores"] = repaired_feature_scores
+        turn["score"] = current_score if score_included else 0
+        turn["judgment"] = judgment
+        turn["score_included"] = score_included
+        turn["excluded_reason"] = str(turn.get("excluded_reason") or build_score_exclusion_reason(
+            judgment,
+            turn["score"],
+            turn.get("reason", ""),
+            repaired_feature_scores
+        ))
+        turn["reason"] = normalize_reason_text(turn.get("reason", ""), repaired_feature_scores)
+
+        if score_included:
+            turn["confidence"] = calculate_confidence_from_feature_scores(repaired_feature_scores, current_score)
+            turn["risk_level"] = get_risk_level_from_score(current_score)
+            running_scores.append(current_score)
+            turn["trend"] = calculate_trend_from_score_values(running_scores)
+        else:
+            turn["confidence"] = 0
+            turn["risk_level"] = "반영 제외"
+            turn["trend"] = "반영 제외"
+
+        if running_scores:
+            turn["average_score"] = round(sum(running_scores) / len(running_scores), 1)
+            recent_scores = running_scores[-RECENT_WINDOW:]
+            turn["recent_average_score"] = round(sum(recent_scores) / len(recent_scores), 1)
+        else:
+            turn["average_score"] = 0.0
+            turn["recent_average_score"] = 0.0
+
+    repaired_score_history = []
+    for index, turn in enumerate(turns):
+        if not turn.get("score_included", True):
+            continue
+
+        if index < len(existing_scores):
+            time_value = existing_scores[index].get("time", turn.get("time", ""))
+        else:
+            time_value = turn.get("time", "")
+
+        repaired_score_history.append({
+            "score": clamp_score(int(turn.get("score", 0))),
+            "time": time_value
+        })
+
+    score_store[session_id] = repaired_score_history[-MAX_SCORE_HISTORY:]
+
+
 def get_turn_history(session_id: str):
+    repair_session_analysis_history(session_id)
     return turn_store.get(session_id, [])
 
 
@@ -503,6 +621,7 @@ def add_score_history(session_id: str, score: int) -> None:
 
 
 def get_score_history(session_id: str):
+    repair_session_analysis_history(session_id)
     return score_store.get(session_id, [])
 
 
@@ -549,6 +668,46 @@ def calculate_confidence_from_feature_scores(feature_scores: dict, total_score: 
     return max(0, min(95, confidence))
 
 
+def has_meaningful_feature_scores(feature_scores: dict) -> bool:
+    if not isinstance(feature_scores, dict):
+        return False
+
+    return any(int(feature_scores.get(key, 0)) > 0 for key in [
+        "repetition",
+        "memory",
+        "time_confusion",
+        "incoherence",
+    ])
+
+
+def should_include_analysis_score(judgment: str, score: int, feature_scores: dict) -> bool:
+    normalized_judgment = str(judgment or "").strip()
+    normalized_score = clamp_score(int(score or 0))
+
+    if normalized_judgment == "판단 어려움" and normalized_score == 0 and not has_meaningful_feature_scores(feature_scores):
+        return False
+
+    return True
+
+
+def build_score_exclusion_reason(judgment: str, score: int, reason: str, feature_scores: dict) -> str:
+    if should_include_analysis_score(judgment, score, feature_scores):
+        return ""
+
+    normalized_reason = str(reason or "").strip()
+
+    if "너무 짧아" in normalized_reason or "입력이 필요" in normalized_reason:
+        return "입력이 너무 짧아 이번 대화는 점수 통계에서 제외했습니다."
+    if "음성 인식 결과" in normalized_reason:
+        return "음성 인식 결과가 없어 이번 대화는 점수 통계에서 제외했습니다."
+    if "입력된 대화가 없습니다" in normalized_reason:
+        return "분석할 대화가 없어 이번 대화는 점수 통계에서 제외했습니다."
+    if "문제가 발생" in normalized_reason or "오류" in normalized_reason:
+        return "분석 중 오류가 발생해 이번 대화는 점수 통계에서 제외했습니다."
+
+    return "분석 결과가 불안정하여 이번 대화는 점수 통계에서 제외했습니다."
+
+
 def get_risk_level_from_score(score: float) -> str:
     if score < 20:
         return "Normal"
@@ -563,20 +722,7 @@ def get_risk_level_from_score(score: float) -> str:
 
 def get_score_trend(session_id: str, window: int = RECENT_WINDOW) -> str:
     history = get_score_history(session_id)
-    if len(history) < 2:
-        return "데이터 부족"
-
-    recent = history[-window:]
-    if len(recent) < 2:
-        return "안정"
-
-    diff = recent[-1]["score"] - recent[0]["score"]
-
-    if diff >= 10:
-        return "상승"
-    if diff <= -10:
-        return "하락"
-    return "안정"
+    return calculate_trend_from_score_values([item["score"] for item in history], window)
 
 
 def transcribe_audio_file(file_path: str) -> str:
@@ -731,17 +877,154 @@ def is_invalid_reason_text(reason: str) -> bool:
     return any(phrase in reason for phrase in blocked_phrases)
 
 
+def looks_like_score_listing(reason: str) -> bool:
+    if not reason:
+        return False
+
+    keywords = [
+        "질문반복점수",
+        "질문 반복 점수",
+        "기억혼란점수",
+        "기억 혼란 점수",
+        "시간혼란점수",
+        "시간/상황 혼란점수",
+        "문장비논리점수",
+        "문장 비논리성점수",
+    ]
+    keyword_hits = sum(1 for keyword in keywords if keyword in reason)
+
+    return keyword_hits >= 2 or ("->" in reason and keyword_hits >= 1)
+
+
+def build_reason_from_scores(scores: dict) -> str:
+    repetition = int(scores.get("repetition", 0))
+    memory = int(scores.get("memory", 0))
+    time_confusion = int(scores.get("time_confusion", 0))
+    incoherence = int(scores.get("incoherence", 0))
+    total = clamp_score(repetition + memory + time_confusion + incoherence)
+
+    observations = []
+
+    if repetition >= 15:
+        observations.append("같은 의미의 질문이 반복되어 질문 반복 경향이 비교적 뚜렷하게 관찰됩니다.")
+    elif repetition > 0:
+        observations.append("질문 표현의 일부 반복이 관찰됩니다.")
+
+    if memory >= 15:
+        observations.append("최근에 제시된 정보를 바로 떠올리지 못하거나 기억이 흐려지는 표현이 나타납니다.")
+    elif memory > 0:
+        observations.append("기억을 떠올리는 데 어려움을 보이는 표현이 일부 확인됩니다.")
+
+    if time_confusion >= 15:
+        observations.append("시간이나 현재 상황을 혼동하는 표현이 나타납니다.")
+    elif time_confusion > 0:
+        observations.append("시간 또는 상황 인식의 경미한 혼란이 관찰됩니다.")
+
+    if incoherence >= 10:
+        observations.append("문장 전개가 다소 비논리적으로 이어지는 구간이 확인됩니다.")
+    elif incoherence > 0:
+        observations.append("일부 문장에서 논리 연결이 약해 보입니다.")
+
+    if not observations:
+        return (
+            "현재 입력에서는 질문 반복, 기억 혼란, 시간 혼란, 문장 비논리성이 뚜렷하게 관찰되지 않습니다. "
+            "다만 단일 대화만으로는 변동이 있을 수 있어 이후 대화와 함께 종합적으로 보는 것이 좋습니다."
+        )
+
+    summary = " ".join(observations[:2])
+    if total >= 20:
+        closing = "이 특징들이 누적되어 인지 위험도 점수가 상승한 것으로 해석됩니다."
+    else:
+        closing = "다만 현재 단계에서는 전반적 위험도가 높다고 단정할 수준은 아닙니다."
+
+    return f"{summary} {closing}"
+
+
+def normalize_reason_text(reason: str, scores: dict) -> str:
+    cleaned = str(reason or "").strip()
+    cleaned = re.sub(r"\r\n?", "\n", cleaned)
+
+    if looks_like_score_listing(cleaned):
+        observations = []
+        for raw_line in cleaned.splitlines():
+            line = re.sub(r"[*_`#]+", "", raw_line).strip(" -\t")
+            if not line:
+                continue
+
+            if "->" in line:
+                observation = line.split("->", 1)[1].strip()
+            elif "=>" in line:
+                observation = line.split("=>", 1)[1].strip()
+            else:
+                match = re.search(r":\s*(.+)$", line)
+                if not match:
+                    continue
+                observation = match.group(1).strip()
+
+            observation = re.sub(r"^\d+\s*", "", observation).strip()
+            normalized_observation = observation.rstrip(". ").strip()
+            if not normalized_observation or normalized_observation in {"없음", "해당 없음", "없습니다"}:
+                continue
+
+            if not re.search(r"[.!?。]$", observation):
+                observation = f"{observation}."
+
+            if observation not in observations:
+                observations.append(observation)
+
+        if len(observations) >= 2:
+            return " ".join(observations[:3])
+
+        return build_reason_from_scores(scores)
+
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
+
+    if is_invalid_reason_text(cleaned) or len(split_sentences(cleaned)) < 2:
+        return build_reason_from_scores(scores)
+
+    return cleaned
+
+
 def parse_analysis_scores(text: str) -> dict:
-    def extract_int(pattern: str, default: int = 0) -> int:
-        match = re.search(pattern, text)
-        return int(match.group(1)) if match else default
+    normalized = str(text or "")
+    normalized = re.sub(r"[*_`#>\-]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
 
-    repetition = clamp_subscore(extract_int(r"질문반복점수:\s*(\d+)"), 25)
-    memory = clamp_subscore(extract_int(r"기억혼란점수:\s*(\d+)"), 25)
-    time_confusion = clamp_subscore(extract_int(r"시간혼란점수:\s*(\d+)"), 30)
-    incoherence = clamp_subscore(extract_int(r"문장비논리점수:\s*(\d+)"), 20)
+    def extract_int(patterns, default: int = 0) -> int:
+        for pattern in patterns:
+            match = re.search(pattern, normalized, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return default
 
-    total = repetition + memory + time_confusion + incoherence
+    repetition = clamp_subscore(extract_int([
+        r"질문\s*반복\s*점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"질문반복점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"질문\s*반복(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)"
+    ]), 25)
+    memory = clamp_subscore(extract_int([
+        r"기억\s*혼란\s*점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"기억혼란점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"기억\s*혼란(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)"
+    ]), 25)
+    time_confusion = clamp_subscore(extract_int([
+        r"시간\s*/?\s*상황\s*혼란(?:\s*점수)?(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"시간\s*혼란\s*점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"시간혼란점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)"
+    ]), 30)
+    incoherence = clamp_subscore(extract_int([
+        r"문장\s*비논리성(?:\s*점수)?(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"문장비논리점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"문장\s*비논리성\s*점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)"
+    ]), 20)
+
+    subtotal = repetition + memory + time_confusion + incoherence
+    declared_total = clamp_score(extract_int([
+        r"의심\s*점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)",
+        r"의심점수(?:\s*\([^)]*\))?\s*[:：]?\s*(\d+)"
+    ]))
+    total = subtotal if subtotal > 0 else declared_total
 
     return {
         "repetition": repetition,
@@ -819,8 +1102,10 @@ def force_analysis_format(raw_text: str) -> str:
     if judgment not in {"정상", "의심", "판단 어려움"}:
         judgment = infer_judgment_from_score(scores["total"])
 
-    if is_invalid_reason_text(reason_text) or len(split_sentences(reason_text)) < 2:
-        reason_text = get_default_reason()
+    if (judgment == "정상" and scores["total"] >= 20) or (judgment == "의심" and scores["total"] < 20):
+        judgment = infer_judgment_from_score(scores["total"])
+
+    reason_text = normalize_reason_text(reason_text, scores)
 
     total = scores["total"]
 
@@ -856,10 +1141,12 @@ def extract_analysis_fields(response_text: str) -> dict:
     reason = reason_match.group(1).strip() if reason_match else get_default_reason()
     judgment = judgment_match.group(1).strip() if judgment_match else infer_judgment_from_score(parsed["total"])
 
-    if is_invalid_reason_text(reason) or len(split_sentences(reason)) < 2:
-        reason = get_default_reason()
+    reason = normalize_reason_text(reason, parsed)
 
     if judgment not in {"정상", "의심", "판단 어려움"}:
+        judgment = infer_judgment_from_score(parsed["total"])
+
+    if (judgment == "정상" and parsed["total"] >= 20) or (judgment == "의심" and parsed["total"] < 20):
         judgment = infer_judgment_from_score(parsed["total"])
 
     return {
@@ -914,17 +1201,19 @@ def build_short_input_result() -> dict:
         "대화 내용이 너무 짧아 언어적 특징을 분석하기 어렵습니다. "
         "조금 더 구체적인 입력이 필요합니다."
     )
+    excluded_reason = "입력이 너무 짧아 이번 대화는 점수 통계에서 제외했습니다."
 
     return {
         "full_text": (
             "답변: 질문 내용이 너무 짧아 답변하기 어렵습니다.\n\n"
             "판단: 판단 어려움\n"
-            "의심점수: 0\n"
+            "의심점수: 반영 제외\n"
             "질문반복점수: 0\n"
             "기억혼란점수: 0\n"
             "시간혼란점수: 0\n"
             "문장비논리점수: 0\n"
-            f"근거: {reason}"
+            f"근거: {reason}\n"
+            f"점수반영: {excluded_reason}"
         ),
         "answer": "질문 내용이 너무 짧아 답변하기 어렵습니다.",
         "judgment": "판단 어려움",
@@ -935,23 +1224,27 @@ def build_short_input_result() -> dict:
             "memory": 0,
             "time_confusion": 0,
             "incoherence": 0
-        }
+        },
+        "score_included": False,
+        "excluded_reason": excluded_reason,
     }
 
 
 def build_error_result() -> dict:
     reason = "응답 생성 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요."
+    excluded_reason = "분석 중 오류가 발생해 이번 대화는 점수 통계에서 제외했습니다."
 
     return {
         "full_text": (
             "답변: 응답 생성 중 문제가 발생했습니다.\n\n"
             "판단: 판단 어려움\n"
-            "의심점수: 0\n"
+            "의심점수: 반영 제외\n"
             "질문반복점수: 0\n"
             "기억혼란점수: 0\n"
             "시간혼란점수: 0\n"
             "문장비논리점수: 0\n"
-            f"근거: {reason}"
+            f"근거: {reason}\n"
+            f"점수반영: {excluded_reason}"
         ),
         "answer": "응답 생성 중 문제가 발생했습니다.",
         "judgment": "판단 어려움",
@@ -962,7 +1255,9 @@ def build_error_result() -> dict:
             "memory": 0,
             "time_confusion": 0,
             "incoherence": 0
-        }
+        },
+        "score_included": False,
+        "excluded_reason": excluded_reason,
     }
 
 
@@ -1012,15 +1307,21 @@ def get_response_from_llama(question: str) -> dict:
 # 공통 JSON 응답
 # =========================
 def build_full_text(answer_text: str, fields: dict) -> str:
+    score_text = fields["score"] if fields.get("score_included", True) else "반영 제외"
+    exclusion_line = ""
+    if fields.get("score_included", True) is False and fields.get("excluded_reason"):
+        exclusion_line = f"\n점수반영: {fields['excluded_reason']}"
+
     return (
-        f"?듬?: {answer_text}\n\n"
-        f"?먮떒: {fields['judgment']}\n"
-        f"?섏떖?먯닔: {fields['score']}\n"
-        f"吏덈Ц諛섎났?먯닔: {fields['feature_scores']['repetition']}\n"
-        f"湲곗뼲?쇰??먯닔: {fields['feature_scores']['memory']}\n"
-        f"?쒓컙?쇰??먯닔: {fields['feature_scores']['time_confusion']}\n"
-        f"臾몄옣鍮꾨끉由ъ젏?? {fields['feature_scores']['incoherence']}\n"
-        f"洹쇨굅: {fields['reason']}"
+        f"답변: {answer_text}\n\n"
+        f"판단: {fields['judgment']}\n"
+        f"의심점수: {score_text}\n"
+        f"질문반복점수: {fields['feature_scores']['repetition']}\n"
+        f"기억혼란점수: {fields['feature_scores']['memory']}\n"
+        f"시간혼란점수: {fields['feature_scores']['time_confusion']}\n"
+        f"문장비논리점수: {fields['feature_scores']['incoherence']}\n"
+        f"근거: {fields['reason']}"
+        f"{exclusion_line}"
     )
 
 
@@ -1036,7 +1337,7 @@ def generate_answer_result(question: str) -> dict:
         answer_text = re.sub(r"^\s*AI:\s*", "", answer_text)
 
         if not answer_text:
-            answer_text = "吏덈Ц??????듬????앹꽦?섏? 紐삵뻽?듬땲??"
+            answer_text = "질문에 대한 답변을 생성하지 못했습니다."
 
         return {
             "answer": answer_text,
@@ -1057,11 +1358,25 @@ def generate_analysis_result(question: str) -> dict:
             "judgment": short_input_result["judgment"],
             "score": short_input_result["score"],
             "reason": short_input_result["reason"],
-            "feature_scores": short_input_result["feature_scores"]
+            "feature_scores": short_input_result["feature_scores"],
+            "score_included": short_input_result["score_included"],
+            "excluded_reason": short_input_result["excluded_reason"],
         }
 
     analysis_text = generate_analysis_with_retry(question)
-    return extract_analysis_fields(analysis_text)
+    fields = extract_analysis_fields(analysis_text)
+    fields["score_included"] = should_include_analysis_score(
+        fields["judgment"],
+        fields["score"],
+        fields["feature_scores"]
+    )
+    fields["excluded_reason"] = build_score_exclusion_reason(
+        fields["judgment"],
+        fields["score"],
+        fields["reason"],
+        fields["feature_scores"]
+    )
+    return fields
 
 
 def get_response_from_llama(question: str) -> dict:
@@ -1079,7 +1394,9 @@ def get_response_from_llama(question: str) -> dict:
         "judgment": fields["judgment"],
         "score": fields["score"],
         "reason": fields["reason"],
-        "feature_scores": fields["feature_scores"]
+        "feature_scores": fields["feature_scores"],
+        "score_included": fields.get("score_included", True),
+        "excluded_reason": fields.get("excluded_reason", ""),
     }
 
 
@@ -1093,7 +1410,9 @@ def build_chat_response(
     reason: str,
     feature_scores: dict,
     follow_up_messages=None,
-    turn=None
+    turn=None,
+    score_included: bool = True,
+    excluded_reason: str = ""
 ):
     recent_average_score = get_recent_average_score(session_id)
     risk_level = get_risk_level_from_score(recent_average_score)
@@ -1109,6 +1428,8 @@ def build_chat_response(
         "score": clamp_score(score),
         "reason": reason,
         "feature_scores": feature_scores,
+        "score_included": bool(score_included),
+        "excluded_reason": str(excluded_reason or ""),
         "average_score": get_average_score(session_id),
         "recent_average_score": recent_average_score,
         "risk_level": risk_level,
@@ -1277,7 +1598,9 @@ def analyze_text():
             "judgment": fields["judgment"],
             "score": fields["score"],
             "reason": fields["reason"],
-            "feature_scores": fields["feature_scores"]
+            "feature_scores": fields["feature_scores"],
+            "score_included": fields.get("score_included", True),
+            "excluded_reason": fields.get("excluded_reason", ""),
         }
 
         add_to_history(session_id, "user", user_input)
@@ -1297,7 +1620,8 @@ def analyze_text():
             history_full_text = f"{history_full_text}\n\n" + "\n\n".join(follow_up_messages)
 
         add_to_history(session_id, "assistant", history_full_text)
-        add_score_history(session_id, result["score"])
+        if result["score_included"]:
+            add_score_history(session_id, result["score"])
         turn = add_turn_history(
             session_id=session_id,
             user_text=user_input,
@@ -1306,7 +1630,9 @@ def analyze_text():
             score=result["score"],
             reason=result["reason"],
             feature_scores=result["feature_scores"],
-            follow_up_messages=follow_up_messages
+            follow_up_messages=follow_up_messages,
+            score_included=result["score_included"],
+            excluded_reason=result["excluded_reason"],
         )
 
         return build_chat_response(
@@ -1319,7 +1645,9 @@ def analyze_text():
             reason=result["reason"],
             feature_scores=result["feature_scores"],
             follow_up_messages=follow_up_messages,
-            turn=turn
+            turn=turn,
+            score_included=result["score_included"],
+            excluded_reason=result["excluded_reason"],
         )
 
     except Exception as e:
@@ -1350,7 +1678,7 @@ def chat():
                 return build_chat_response(
                     session_id=session_id,
                     user_speech="",
-                    sys_response="판단: 판단 어려움\n의심점수: 0\n질문반복점수: 0\n기억혼란점수: 0\n시간혼란점수: 0\n문장비논리점수: 0\n근거: 음성 인식 결과가 없어 분석할 수 없습니다. 다시 녹음해 주세요.",
+                    sys_response="판단: 판단 어려움\n의심점수: 반영 제외\n질문반복점수: 0\n기억혼란점수: 0\n시간혼란점수: 0\n문장비논리점수: 0\n근거: 음성 인식 결과가 없어 분석할 수 없습니다. 다시 녹음해 주세요.\n점수반영: 음성 인식 결과가 없어 이번 대화는 점수 통계에서 제외했습니다.",
                     answer="",
                     judgment="판단 어려움",
                     score=0,
@@ -1360,7 +1688,9 @@ def chat():
                         "memory": 0,
                         "time_confusion": 0,
                         "incoherence": 0
-                    }
+                    },
+                    score_included=False,
+                    excluded_reason="음성 인식 결과가 없어 이번 대화는 점수 통계에서 제외했습니다.",
                 )
         else:
             data = request.get_json(silent=True) or {}
@@ -1370,7 +1700,7 @@ def chat():
                 return build_chat_response(
                     session_id=session_id,
                     user_speech="",
-                    sys_response="판단: 판단 어려움\n의심점수: 0\n질문반복점수: 0\n기억혼란점수: 0\n시간혼란점수: 0\n문장비논리점수: 0\n근거: 입력된 대화가 없습니다. 분석할 내용이 필요합니다.",
+                    sys_response="판단: 판단 어려움\n의심점수: 반영 제외\n질문반복점수: 0\n기억혼란점수: 0\n시간혼란점수: 0\n문장비논리점수: 0\n근거: 입력된 대화가 없습니다. 분석할 내용이 필요합니다.\n점수반영: 분석할 대화가 없어 이번 대화는 점수 통계에서 제외했습니다.",
                     answer="",
                     judgment="판단 어려움",
                     score=0,
@@ -1380,7 +1710,9 @@ def chat():
                         "memory": 0,
                         "time_confusion": 0,
                         "incoherence": 0
-                    }
+                    },
+                    score_included=False,
+                    excluded_reason="분석할 대화가 없어 이번 대화는 점수 통계에서 제외했습니다.",
                 )
 
         recall_feedback = evaluate_recall_answer(session_id, user_input)
@@ -1391,7 +1723,8 @@ def chat():
 
         add_to_history(session_id, "user", user_input)
         add_to_history(session_id, "assistant", result["full_text"])
-        add_score_history(session_id, result["score"])
+        if result.get("score_included", True):
+            add_score_history(session_id, result["score"])
         follow_up_messages = []
 
         recall_prompt = maybe_advance_recall_test(session_id)
@@ -1408,7 +1741,9 @@ def chat():
             score=result["score"],
             reason=result["reason"],
             feature_scores=result["feature_scores"],
-            follow_up_messages=follow_up_messages
+            follow_up_messages=follow_up_messages,
+            score_included=result.get("score_included", True),
+            excluded_reason=result.get("excluded_reason", ""),
         )
 
         return build_chat_response(
@@ -1421,7 +1756,9 @@ def chat():
             reason=result["reason"],
             feature_scores=result["feature_scores"],
             follow_up_messages=follow_up_messages,
-            turn=turn
+            turn=turn,
+            score_included=result.get("score_included", True),
+            excluded_reason=result.get("excluded_reason", ""),
         )
 
     except Exception as e:

@@ -53,6 +53,7 @@ RECALL_WORDS = [
 conversation_store = {}
 score_store = {}
 recall_store = {}
+turn_store = {}
 answer_chain = None
 analysis_chain = None
 analysis_retry_chain = None
@@ -411,6 +412,7 @@ def get_or_create_session_id() -> str:
 
     conversation_store.setdefault(session_id, [])
     score_store.setdefault(session_id, [])
+    turn_store.setdefault(session_id, [])
     recall_store.setdefault(
         session_id,
         {
@@ -435,6 +437,53 @@ def add_to_history(session_id: str, role: str, content: str) -> None:
     max_messages = MAX_HISTORY_TURNS * 2
     if len(conversation_store[session_id]) > max_messages:
         conversation_store[session_id] = conversation_store[session_id][-max_messages:]
+
+
+def add_turn_history(
+    session_id: str,
+    user_text: str,
+    answer: str,
+    judgment: str,
+    score: int,
+    reason: str,
+    feature_scores: dict,
+    follow_up_messages=None
+) -> dict:
+    turn_store.setdefault(session_id, [])
+
+    turn = {
+        "turn_id": str(uuid.uuid4()),
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "user_text": user_text,
+        "answer": answer,
+        "judgment": judgment,
+        "score": clamp_score(score),
+        "reason": reason,
+        "feature_scores": {
+            "repetition": int(feature_scores.get("repetition", 0)),
+            "memory": int(feature_scores.get("memory", 0)),
+            "time_confusion": int(feature_scores.get("time_confusion", 0)),
+            "incoherence": int(feature_scores.get("incoherence", 0))
+        },
+        "follow_up_messages": follow_up_messages or [],
+    }
+
+    turn_store[session_id].append(turn)
+
+    if len(turn_store[session_id]) > MAX_SCORE_HISTORY:
+        turn_store[session_id] = turn_store[session_id][-MAX_SCORE_HISTORY:]
+
+    turn["risk_level"] = get_risk_level_from_score(turn["score"])
+    turn["trend"] = get_score_trend(session_id)
+    turn["average_score"] = get_average_score(session_id)
+    turn["recent_average_score"] = get_recent_average_score(session_id)
+    turn["confidence"] = calculate_confidence_from_feature_scores(turn["feature_scores"], turn["score"])
+
+    return turn
+
+
+def get_turn_history(session_id: str):
+    return turn_store.get(session_id, [])
 
 
 def get_user_turn_count(session_id: str) -> int:
@@ -474,6 +523,30 @@ def get_recent_average_score(session_id: str, window: int = RECENT_WINDOW) -> fl
     recent = history[-window:]
     avg = sum(item["score"] for item in recent) / len(recent)
     return round(avg, 1)
+
+
+def calculate_confidence_from_feature_scores(feature_scores: dict, total_score: int) -> int:
+    repetition = int(feature_scores.get("repetition", 0))
+    memory = int(feature_scores.get("memory", 0))
+    time_confusion = int(feature_scores.get("time_confusion", 0))
+    incoherence = int(feature_scores.get("incoherence", 0))
+
+    confidence = 55
+
+    if memory > 0:
+        confidence += 8
+    if time_confusion > 0:
+        confidence += 8
+    if repetition > 0:
+        confidence += 6
+    if incoherence > 0:
+        confidence += 6
+    if total_score >= 40:
+        confidence += 8
+    if total_score >= 60:
+        confidence += 4
+
+    return max(0, min(95, confidence))
 
 
 def get_risk_level_from_score(score: float) -> str:
@@ -938,6 +1011,78 @@ def get_response_from_llama(question: str) -> dict:
 # =========================
 # 공통 JSON 응답
 # =========================
+def build_full_text(answer_text: str, fields: dict) -> str:
+    return (
+        f"?듬?: {answer_text}\n\n"
+        f"?먮떒: {fields['judgment']}\n"
+        f"?섏떖?먯닔: {fields['score']}\n"
+        f"吏덈Ц諛섎났?먯닔: {fields['feature_scores']['repetition']}\n"
+        f"湲곗뼲?쇰??먯닔: {fields['feature_scores']['memory']}\n"
+        f"?쒓컙?쇰??먯닔: {fields['feature_scores']['time_confusion']}\n"
+        f"臾몄옣鍮꾨끉由ъ젏?? {fields['feature_scores']['incoherence']}\n"
+        f"洹쇨굅: {fields['reason']}"
+    )
+
+
+def generate_answer_result(question: str) -> dict:
+    question = normalize_text(question)
+
+    if not validate_user_text(question):
+        return build_short_input_result()
+
+    try:
+        answer_response = get_or_create_answer_chain().invoke({"question": question})
+        answer_text = answer_response.get("text", "").strip()
+        answer_text = re.sub(r"^\s*AI:\s*", "", answer_text)
+
+        if not answer_text:
+            answer_text = "吏덈Ц??????듬????앹꽦?섏? 紐삵뻽?듬땲??"
+
+        return {
+            "answer": answer_text,
+            "is_answer_only": True
+        }
+
+    except Exception as e:
+        print(f"LLM ?묐떟 ?앹꽦 ?ㅽ뙣: {e}")
+        return build_error_result()
+
+
+def generate_analysis_result(question: str) -> dict:
+    question = normalize_text(question)
+
+    if not validate_user_text(question):
+        short_input_result = build_short_input_result()
+        return {
+            "judgment": short_input_result["judgment"],
+            "score": short_input_result["score"],
+            "reason": short_input_result["reason"],
+            "feature_scores": short_input_result["feature_scores"]
+        }
+
+    analysis_text = generate_analysis_with_retry(question)
+    return extract_analysis_fields(analysis_text)
+
+
+def get_response_from_llama(question: str) -> dict:
+    answer_result = generate_answer_result(question)
+
+    if all(key in answer_result for key in ["full_text", "judgment", "score", "reason", "feature_scores"]):
+        return answer_result
+
+    fields = generate_analysis_result(question)
+    full_text = build_full_text(answer_result["answer"], fields)
+
+    return {
+        "full_text": full_text,
+        "answer": answer_result["answer"],
+        "judgment": fields["judgment"],
+        "score": fields["score"],
+        "reason": fields["reason"],
+        "feature_scores": fields["feature_scores"]
+    }
+
+
 def build_chat_response(
     session_id: str,
     user_speech: str,
@@ -946,7 +1091,9 @@ def build_chat_response(
     judgment: str,
     score: int,
     reason: str,
-    feature_scores: dict
+    feature_scores: dict,
+    follow_up_messages=None,
+    turn=None
 ):
     recent_average_score = get_recent_average_score(session_id)
     risk_level = get_risk_level_from_score(recent_average_score)
@@ -957,6 +1104,7 @@ def build_chat_response(
         "user_speech": user_speech,
         "sys_response": sys_response,
         "answer": answer,
+        "follow_up_messages": follow_up_messages or [],
         "judgment": judgment,
         "score": clamp_score(score),
         "reason": reason,
@@ -966,6 +1114,8 @@ def build_chat_response(
         "risk_level": risk_level,
         "trend": trend,
         "score_history": get_score_history(session_id),
+        "turn_history": get_turn_history(session_id),
+        "turn": turn,
         "recall": serialize_recall_state(session_id)
     })
 
@@ -1081,8 +1231,8 @@ def transcribe_audio():
         return jsonify({"error": "음성 인식 중 문제가 발생했습니다."}), 500
 
 
-@app.route("/analyze-text", methods=["POST"])
-def analyze_text():
+@app.route("/generate-answer", methods=["POST"])
+def generate_answer():
     session_id = get_or_create_session_id()
 
     try:
@@ -1090,22 +1240,74 @@ def analyze_text():
         user_input = normalize_text(data.get("message", ""))
 
         if not user_input:
+            return jsonify({"error": "遺꾩꽍???띿뒪?멸? ?놁뒿?덈떎."}), 400
+
+        result = generate_answer_result(user_input)
+
+        return jsonify({
+            "session_id": session_id,
+            "user_speech": user_input,
+            "answer": result.get("answer", ""),
+            "is_answer_only": True
+        })
+
+    except Exception as e:
+        print(f"?묐떟 ?ъ쟾 ?앹꽦 ?ㅻ쪟: {e}")
+        return jsonify({"error": "?묐떟 ?앹꽦 以?臾몄젣媛 諛쒖깮?덉뒿?덈떎."}), 500
+
+
+@app.route("/analyze-text", methods=["POST"])
+def analyze_text():
+    session_id = get_or_create_session_id()
+
+    try:
+        data = request.get_json(silent=True) or {}
+        user_input = normalize_text(data.get("message", ""))
+        precomputed_answer = normalize_text(data.get("answer", ""))
+
+        if not user_input:
             return jsonify({"error": "분석할 텍스트가 없습니다."}), 400
 
         recall_feedback = evaluate_recall_answer(session_id, user_input)
-        result = get_response_from_llama(user_input)
+        answer_result = {"answer": precomputed_answer} if precomputed_answer else generate_answer_result(user_input)
+        fields = generate_analysis_result(user_input)
 
-        if recall_feedback:
-            result["answer"] = f"{result['answer']}\n\n{recall_feedback}"
+        result = {
+            "answer": answer_result.get("answer", ""),
+            "judgment": fields["judgment"],
+            "score": fields["score"],
+            "reason": fields["reason"],
+            "feature_scores": fields["feature_scores"]
+        }
 
         add_to_history(session_id, "user", user_input)
-        add_to_history(session_id, "assistant", result["full_text"])
-        add_score_history(session_id, result["score"])
+        follow_up_messages = []
+
+        if recall_feedback:
+            follow_up_messages.append(recall_feedback)
 
         recall_prompt = maybe_advance_recall_test(session_id)
         if recall_prompt:
-            result["answer"] = f"{result['answer']}\n\n{recall_prompt}"
-            result["full_text"] = f"{result['full_text']}\n\n{recall_prompt}"
+            follow_up_messages.append(recall_prompt)
+
+        result["full_text"] = build_full_text(result["answer"], fields)
+
+        history_full_text = result["full_text"]
+        if follow_up_messages:
+            history_full_text = f"{history_full_text}\n\n" + "\n\n".join(follow_up_messages)
+
+        add_to_history(session_id, "assistant", history_full_text)
+        add_score_history(session_id, result["score"])
+        turn = add_turn_history(
+            session_id=session_id,
+            user_text=user_input,
+            answer=result["answer"],
+            judgment=result["judgment"],
+            score=result["score"],
+            reason=result["reason"],
+            feature_scores=result["feature_scores"],
+            follow_up_messages=follow_up_messages
+        )
 
         return build_chat_response(
             session_id=session_id,
@@ -1115,7 +1317,9 @@ def analyze_text():
             judgment=result["judgment"],
             score=result["score"],
             reason=result["reason"],
-            feature_scores=result["feature_scores"]
+            feature_scores=result["feature_scores"],
+            follow_up_messages=follow_up_messages,
+            turn=turn
         )
 
     except Exception as e:
@@ -1188,11 +1392,24 @@ def chat():
         add_to_history(session_id, "user", user_input)
         add_to_history(session_id, "assistant", result["full_text"])
         add_score_history(session_id, result["score"])
+        follow_up_messages = []
 
         recall_prompt = maybe_advance_recall_test(session_id)
         if recall_prompt:
             result["answer"] = f"{result['answer']}\n\n{recall_prompt}"
             result["full_text"] = f"{result['full_text']}\n\n{recall_prompt}"
+            follow_up_messages.append(recall_prompt)
+
+        turn = add_turn_history(
+            session_id=session_id,
+            user_text=user_input,
+            answer=result["answer"],
+            judgment=result["judgment"],
+            score=result["score"],
+            reason=result["reason"],
+            feature_scores=result["feature_scores"],
+            follow_up_messages=follow_up_messages
+        )
 
         return build_chat_response(
             session_id=session_id,
@@ -1202,7 +1419,9 @@ def chat():
             judgment=result["judgment"],
             score=result["score"],
             reason=result["reason"],
-            feature_scores=result["feature_scores"]
+            feature_scores=result["feature_scores"],
+            follow_up_messages=follow_up_messages,
+            turn=turn
         )
 
     except Exception as e:
@@ -1221,6 +1440,7 @@ def score_history():
         "risk_level": get_risk_level_from_score(get_recent_average_score(session_id)),
         "trend": get_score_trend(session_id),
         "score_history": get_score_history(session_id),
+        "turn_history": get_turn_history(session_id),
         "recall": serialize_recall_state(session_id)
     })
 
@@ -1231,6 +1451,7 @@ def reset_history():
 
     conversation_store[session_id] = []
     score_store[session_id] = []
+    turn_store[session_id] = []
     recall_store[session_id] = {
         "status": "idle",
         "target_word": "",
@@ -1247,6 +1468,7 @@ def reset_history():
         "risk_level": "Normal",
         "trend": "데이터 부족",
         "score_history": [],
+        "turn_history": [],
         "recall": serialize_recall_state(session_id)
     })
 

@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: ncai-dementia-risk-monitor
+    runtime: docker
+    plan: starter
+    region: singapore
+    autoDeployTrigger: commit
+    healthCheckPath: /health
+    dockerfilePath: ./Dockerfile
+    disk:
+      name: model-data
+      mountPath: /data
+      sizeGB: 25
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+      - key: WAITRESS_THREADS
+        value: 8
+      - key: MODEL_PATH
+        value: /data/models/EXAONE-3.5-7.8B-Instruct-Q8_0.gguf
+      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        sync: false
+      - key: MODEL_DOWNLOAD_URL
+        sync: false

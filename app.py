@@ -4,26 +4,37 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.chains import LLMChain
 from langchain_community.llms import LlamaCpp
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import os
 import re
 import uuid
 import random
+import socket
+import json
+import tempfile
 from datetime import datetime
+
+try:
+    from waitress import serve
+except ImportError:
+    serve = None
 
 
 # =========================
 # 기본 설정
 # =========================
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.config["JSON_AS_ASCII"] = False
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "EXAONE-3.5-7.8B-Instruct-Q8_0.gguf")
-GOOGLE_KEY_PATH = os.path.join(BASE_DIR, "stt-bot-489913-807430be631b.json")
+DEFAULT_MODEL_PATH = os.path.join(BASE_DIR, "models", "EXAONE-3.5-7.8B-Instruct-Q8_0.gguf")
+DEFAULT_GOOGLE_KEY_PATH = os.path.join(BASE_DIR, "stt-bot-489913-807430be631b.json")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_KEY_PATH
 
 MAX_HISTORY_TURNS = 12
 MAX_SCORE_HISTORY = 30
@@ -42,6 +53,11 @@ RECALL_WORDS = [
 conversation_store = {}
 score_store = {}
 recall_store = {}
+answer_chain = None
+analysis_chain = None
+analysis_retry_chain = None
+speech_client = None
+temp_google_credentials_path = None
 
 
 # =========================
@@ -247,33 +263,118 @@ analysis_retry_prompt = ChatPromptTemplate.from_messages(
 # =========================
 # LLM 로드
 # =========================
-answer_llm = LlamaCpp(
-    model_path=MODEL_PATH,
-    temperature=0.2,
-    top_p=0.9,
-    max_tokens=256,
-    n_ctx=4096,
-    verbose=False,
-)
-
-analysis_llm = LlamaCpp(
-    model_path=MODEL_PATH,
-    temperature=0.0,
-    top_p=0.9,
-    max_tokens=256,
-    n_ctx=4096,
-    verbose=False,
-)
-
-answer_chain = LLMChain(prompt=answer_prompt, llm=answer_llm)
-analysis_chain = LLMChain(prompt=analysis_prompt, llm=analysis_llm)
-analysis_retry_chain = LLMChain(prompt=analysis_retry_prompt, llm=analysis_llm)
+def get_model_path() -> str:
+    return os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH)
 
 
-# =========================
-# Google STT
-# =========================
-speech_client = speech.SpeechClient()
+def setup_google_credentials() -> str | None:
+    global temp_google_credentials_path
+
+    explicit_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if explicit_path:
+        return explicit_path
+
+    credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+    if credentials_json:
+        if temp_google_credentials_path and os.path.exists(temp_google_credentials_path):
+            return temp_google_credentials_path
+
+        fd, temp_path = tempfile.mkstemp(prefix="gcp-creds-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            json.dump(json.loads(credentials_json), temp_file, ensure_ascii=False)
+
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_path
+        temp_google_credentials_path = temp_path
+        return temp_path
+
+    if os.path.exists(DEFAULT_GOOGLE_KEY_PATH):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = DEFAULT_GOOGLE_KEY_PATH
+        return DEFAULT_GOOGLE_KEY_PATH
+
+    return None
+
+
+def get_model_status() -> dict:
+    model_path = get_model_path()
+    return {
+        "path": model_path,
+        "exists": os.path.exists(model_path)
+    }
+
+
+def get_google_credentials_status() -> dict:
+    credentials_path = setup_google_credentials()
+    return {
+        "path": credentials_path or "",
+        "configured": bool(credentials_path)
+    }
+
+
+def get_or_create_answer_chain():
+    global answer_chain
+
+    if answer_chain is not None:
+        return answer_chain
+
+    model_path = get_model_path()
+    if not os.path.exists(model_path):
+        raise RuntimeError(
+            f"Model file not found: {model_path}. Set MODEL_PATH to a valid GGUF model path."
+        )
+
+    answer_llm = LlamaCpp(
+        model_path=model_path,
+        temperature=0.2,
+        top_p=0.9,
+        max_tokens=256,
+        n_ctx=4096,
+        verbose=False,
+    )
+    answer_chain = LLMChain(prompt=answer_prompt, llm=answer_llm)
+    return answer_chain
+
+
+def get_or_create_analysis_chains():
+    global analysis_chain, analysis_retry_chain
+
+    if analysis_chain is not None and analysis_retry_chain is not None:
+        return analysis_chain, analysis_retry_chain
+
+    model_path = get_model_path()
+    if not os.path.exists(model_path):
+        raise RuntimeError(
+            f"Model file not found: {model_path}. Set MODEL_PATH to a valid GGUF model path."
+        )
+
+    analysis_llm = LlamaCpp(
+        model_path=model_path,
+        temperature=0.0,
+        top_p=0.9,
+        max_tokens=256,
+        n_ctx=4096,
+        verbose=False,
+    )
+
+    analysis_chain = LLMChain(prompt=analysis_prompt, llm=analysis_llm)
+    analysis_retry_chain = LLMChain(prompt=analysis_retry_prompt, llm=analysis_llm)
+    return analysis_chain, analysis_retry_chain
+
+
+def get_or_create_speech_client():
+    global speech_client
+
+    if speech_client is not None:
+        return speech_client
+
+    credentials_path = setup_google_credentials()
+    if not credentials_path:
+        raise RuntimeError(
+            "Google STT credentials are not configured. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_APPLICATION_CREDENTIALS_JSON."
+        )
+
+    speech_client = speech.SpeechClient()
+    return speech_client
 
 
 # =========================
@@ -406,6 +507,8 @@ def get_score_trend(session_id: str, window: int = RECENT_WINDOW) -> str:
 
 
 def transcribe_audio_file(file_path: str) -> str:
+    client = get_or_create_speech_client()
+
     with open(file_path, "rb") as f:
         content = f.read()
 
@@ -417,7 +520,7 @@ def transcribe_audio_file(file_path: str) -> str:
         max_alternatives=3,
     )
 
-    response = speech_client.recognize(config=config, audio=audio)
+    response = client.recognize(config=config, audio=audio)
 
     transcripts = []
     for result in response.results:
@@ -701,15 +804,16 @@ def extract_analysis_fields(response_text: str) -> dict:
 
 def generate_analysis_with_retry(question: str, max_attempts: int = MAX_ANALYSIS_RETRY) -> str:
     previous_response = ""
+    primary_chain, retry_chain = get_or_create_analysis_chains()
 
     for attempt in range(max_attempts):
         try:
             if attempt == 0:
-                response = analysis_chain.invoke({
+                response = primary_chain.invoke({
                     "question": question
                 })
             else:
-                response = analysis_retry_chain.invoke({
+                response = retry_chain.invoke({
                     "question": question,
                     "previous_response": previous_response
                 })
@@ -796,7 +900,7 @@ def get_response_from_llama(question: str) -> dict:
         return build_short_input_result()
 
     try:
-        answer_response = answer_chain.invoke({"question": question})
+        answer_response = get_or_create_answer_chain().invoke({"question": question})
         answer_text = answer_response.get("text", "").strip()
         answer_text = re.sub(r"^\s*AI:\s*", "", answer_text)
 
@@ -866,12 +970,85 @@ def build_chat_response(
     })
 
 
+def get_server_host() -> str:
+    return os.getenv("HOST", "0.0.0.0")
+
+
+def get_server_port() -> int:
+    return int(os.getenv("PORT", "5000"))
+
+
+def get_waitress_threads() -> int:
+    return int(os.getenv("WAITRESS_THREADS", "8"))
+
+
+def get_local_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+
+
+def print_server_urls(host: str, port: int) -> None:
+    local_ip = get_local_ip()
+
+    print("=" * 60)
+    print("NCAI server is starting")
+    print(f"Local URL:   http://127.0.0.1:{port}")
+    print(f"LAN URL:     http://{local_ip}:{port}")
+    if host not in {"0.0.0.0", "::"}:
+        print(f"Bind Host:   {host}")
+    else:
+        print("Bind Host:   0.0.0.0 (all network interfaces)")
+    print("=" * 60)
+
+
+def run_server() -> None:
+    host = get_server_host()
+    port = get_server_port()
+
+    print_server_urls(host, port)
+
+    if serve is not None:
+        serve(
+            app,
+            host=host,
+            port=port,
+            threads=get_waitress_threads()
+        )
+        return
+
+    print("waitress is not installed. Falling back to Flask development server.")
+    app.run(host=host, port=port, debug=False)
+
+
 # =========================
 # 라우트
 # =========================
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    model_status = get_model_status()
+    credentials_status = get_google_credentials_status()
+    ready = model_status["exists"] and credentials_status["configured"]
+
+    return jsonify({
+        "status": "ok" if ready else "degraded",
+        "service": "ncai-dementia-risk-monitor",
+        "time": datetime.now().isoformat(),
+        "ready": ready,
+        "model": model_status,
+        "google_credentials": credentials_status
+    })
 
 
 @app.route("/transcribe-audio", methods=["POST"])
@@ -1075,4 +1252,4 @@ def reset_history():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    run_server()

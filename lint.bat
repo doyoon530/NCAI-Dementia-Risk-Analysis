@@ -1,13 +1,13 @@
 @echo off
 setlocal
 
-ruff check app.py
+python -m ruff check app.py ncai_app
 if errorlevel 1 exit /b %errorlevel%
 
-python -m py_compile app.py
+python -m compileall -q app.py ncai_app
 if errorlevel 1 exit /b %errorlevel%
 
-prettier --check "templates/**/*.html" "static/**/*.css" "static/**/*.js"
+"%ProgramFiles%\nodejs\node.exe" "%~dp0node_modules\prettier\bin\prettier.cjs" --check "templates/**/*.html" "static/**/*.css" "static/**/*.js"
 if errorlevel 1 exit /b %errorlevel%
 
 echo Lint checks passed.

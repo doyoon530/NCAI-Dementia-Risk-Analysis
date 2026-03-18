@@ -17,13 +17,76 @@ const pythonCommand = process.env.PYTHON || "python";
 const ffmpegCommand = process.env.FFMPEG || "ffmpeg";
 const gifOutputPath = path.join(imageOutputDir, "demo-flow.gif");
 
-const scenarios = [
+const scenarioShots = [
   { name: "overview", file: "01-overview.png" },
   { name: "recording", file: "02-recording-state.png" },
   { name: "answer", file: "03-answer-ready.png" },
   { name: "analysis-progress", file: "04-analysis-progress.png" },
   { name: "final", file: "05-final-dashboard.png" },
   { name: "recall", file: "06-recall-test.png" },
+];
+
+const cardShots = [
+  {
+    name: "status",
+    scenario: "final",
+    selector: "#statusCard",
+    file: "card-status-risk.png",
+  },
+  {
+    name: "metrics",
+    scenario: "final",
+    selector: "#sidebarMetricsDisclosure",
+    file: "card-sidebar-metrics.png",
+    setup: async (page) => openDisclosure(page, "#sidebarMetricsDisclosure"),
+  },
+  {
+    name: "process",
+    scenario: "analysis-progress",
+    selector: "#processPanel",
+    file: "card-process-panel.png",
+  },
+  {
+    name: "session-summary",
+    scenario: "final",
+    selector: "#analysisHeroCard",
+    file: "card-session-summary.png",
+  },
+  {
+    name: "analysis-result",
+    scenario: "final",
+    selector: "#analysisResultCard",
+    file: "card-analysis-result.png",
+    setup: async (page) => openDisclosure(page, "#analysisDetailDisclosure"),
+  },
+  {
+    name: "feature-breakdown",
+    scenario: "final",
+    selector: "#featureBreakdownCard",
+    file: "card-feature-breakdown.png",
+    setup: async (page) => openDisclosure(page, "#analysisDetailDisclosure"),
+  },
+  {
+    name: "confidence",
+    scenario: "final",
+    selector: "#confidenceCard",
+    file: "card-confidence.png",
+    setup: async (page) => openDisclosure(page, "#analysisDetailDisclosure"),
+  },
+  {
+    name: "timeline",
+    scenario: "final",
+    selector: "#historyDisclosure",
+    file: "card-timeline-report.png",
+    setup: async (page) => openDisclosure(page, "#historyDisclosure"),
+  },
+  {
+    name: "recall",
+    scenario: "recall",
+    selector: "#recallDisclosure",
+    file: "card-recall-test.png",
+    setup: async (page) => openDisclosure(page, "#recallDisclosure"),
+  },
 ];
 
 async function isServerReady() {
@@ -83,18 +146,18 @@ async function buildGif() {
   const manifestPath = path.join(imageOutputDir, "demo-flow.frames.txt");
   const manifestLines = [];
 
-  for (const [index, scenario] of scenarios.entries()) {
+  for (const [index, scenario] of scenarioShots.entries()) {
     const framePath = path
       .join(imageOutputDir, scenario.file)
       .replace(/\\/g, "/");
-    const duration = index === scenarios.length - 1 ? 1.8 : 1.25;
+    const duration = index === scenarioShots.length - 1 ? 1.8 : 1.25;
 
     manifestLines.push(`file '${framePath}'`);
     manifestLines.push(`duration ${duration}`);
   }
 
   const lastFramePath = path
-    .join(imageOutputDir, scenarios[scenarios.length - 1].file)
+    .join(imageOutputDir, scenarioShots[scenarioShots.length - 1].file)
     .replace(/\\/g, "/");
   manifestLines.push(`file '${lastFramePath}'`);
 
@@ -115,6 +178,63 @@ async function buildGif() {
     ]);
   } finally {
     await fs.rm(manifestPath, { force: true });
+  }
+}
+
+async function prepareScenario(page, scenarioName) {
+  const targetUrl = `${baseUrl}/?demo=${encodeURIComponent(scenarioName)}`;
+  await page.goto(targetUrl, { waitUntil: "networkidle" });
+  await page.waitForFunction(
+    (expectedScenario) =>
+      document.body?.dataset?.demoReady === "true" &&
+      document.body?.dataset?.demoScenario === expectedScenario,
+    scenarioName,
+  );
+  await page.waitForTimeout(500);
+}
+
+async function openDisclosure(page, selector) {
+  await page.locator(selector).evaluate((element) => {
+    element.open = true;
+  });
+  await page.waitForTimeout(300);
+}
+
+async function captureFullScreenshots(page) {
+  for (const scenario of scenarioShots) {
+    console.log(`[capture] ${scenario.name} 전체 화면을 캡처합니다.`);
+    await prepareScenario(page, scenario.name);
+
+    const outputPath = path.join(imageOutputDir, scenario.file);
+    await page.screenshot({
+      path: outputPath,
+      fullPage: true,
+    });
+
+    console.log(`[capture] 저장 완료: ${outputPath}`);
+  }
+}
+
+async function captureCardScreenshots(page) {
+  for (const shot of cardShots) {
+    console.log(`[capture] ${shot.name} 카드를 캡처합니다.`);
+    await prepareScenario(page, shot.scenario);
+
+    if (shot.setup) {
+      await shot.setup(page);
+    }
+
+    const locator = page.locator(shot.selector);
+    await locator.scrollIntoViewIfNeeded();
+    await page.waitForTimeout(250);
+
+    const outputPath = path.join(imageOutputDir, shot.file);
+    await locator.screenshot({
+      path: outputPath,
+      animations: "disabled",
+    });
+
+    console.log(`[capture] 저장 완료: ${outputPath}`);
   }
 }
 
@@ -141,29 +261,10 @@ async function captureScreenshots() {
     });
     const page = await context.newPage();
 
-    for (const scenario of scenarios) {
-      const targetUrl = `${baseUrl}/?demo=${encodeURIComponent(scenario.name)}`;
-      console.log(`[capture] ${scenario.name} 장면을 캡처합니다.`);
-
-      await page.goto(targetUrl, { waitUntil: "networkidle" });
-      await page.waitForFunction(
-        (expectedScenario) =>
-          document.body?.dataset?.demoReady === "true" &&
-          document.body?.dataset?.demoScenario === expectedScenario,
-        scenario.name,
-      );
-      await page.waitForTimeout(500);
-
-      const outputPath = path.join(imageOutputDir, scenario.file);
-      await page.screenshot({
-        path: outputPath,
-        fullPage: true,
-      });
-
-      console.log(`[capture] 저장 완료: ${outputPath}`);
-    }
-
+    await captureFullScreenshots(page);
+    await captureCardScreenshots(page);
     await context.close();
+
     await buildGif();
     console.log(`[capture] GIF 저장 완료: ${gifOutputPath}`);
   } finally {

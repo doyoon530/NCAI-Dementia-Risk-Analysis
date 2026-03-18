@@ -24,6 +24,136 @@
       </div>
     </div>
 
+    <div id="sessionReportModal" class="report-modal hidden">
+      <div
+        class="report-modal-dialog glass-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="reportModalTitle"
+      >
+        <div class="report-modal-head">
+          <div>
+            <div class="report-modal-kicker">세션 요약</div>
+            <h2 id="reportModalTitle" class="report-modal-title">
+              세션 리포트
+            </h2>
+            <p class="report-modal-subtitle" id="reportGeneratedAt">
+              아직 분석 결과가 없습니다.
+            </p>
+          </div>
+          <button
+            id="closeSessionReport"
+            class="report-close-btn"
+            type="button"
+            aria-label="리포트 닫기"
+          >
+            ×
+          </button>
+        </div>
+
+        <div class="report-hero">
+          <div>
+            <div class="report-hero-title" id="reportHeadline">
+              대화 세션 요약
+            </div>
+            <div class="report-hero-copy" id="reportSubtext">
+              대화를 시작하면 세션 리포트가 이곳에 정리됩니다.
+            </div>
+          </div>
+          <span class="report-status-badge is-idle" id="reportStatusBadge"
+            >대기</span
+          >
+        </div>
+
+        <div class="report-metrics-grid">
+          <div class="report-metric-card">
+            <div class="report-metric-label">분석 대화 수</div>
+            <div class="report-metric-value" id="reportTurnCount">0</div>
+          </div>
+          <div class="report-metric-card">
+            <div class="report-metric-label">점수 반영 수</div>
+            <div class="report-metric-value" id="reportIncludedCount">0</div>
+          </div>
+          <div class="report-metric-card">
+            <div class="report-metric-label">전체 평균</div>
+            <div class="report-metric-value" id="reportAverageScore">0.0</div>
+          </div>
+          <div class="report-metric-card">
+            <div class="report-metric-label">최근 5회 평균</div>
+            <div class="report-metric-value" id="reportRecentAverage">0.0</div>
+          </div>
+          <div class="report-metric-card">
+            <div class="report-metric-label">최신 점수</div>
+            <div class="report-metric-value" id="reportLatestScore">-</div>
+          </div>
+          <div class="report-metric-card">
+            <div class="report-metric-label">최고 위험 점수</div>
+            <div class="report-metric-value" id="reportPeakScore">-</div>
+          </div>
+        </div>
+
+        <div class="report-section-grid">
+          <section class="report-section">
+            <div class="report-section-title">최신 분석 요약</div>
+            <div class="report-highlight-grid">
+              <div class="report-highlight-item">
+                <span>판단</span>
+                <strong id="reportLatestJudgment">-</strong>
+              </div>
+              <div class="report-highlight-item">
+                <span>위험도</span>
+                <strong id="reportLatestRisk">-</strong>
+              </div>
+              <div class="report-highlight-item">
+                <span>추세</span>
+                <strong id="reportLatestTrend">-</strong>
+              </div>
+              <div class="report-highlight-item">
+                <span>모드</span>
+                <strong id="reportLlmMode">-</strong>
+              </div>
+            </div>
+            <div class="report-reason-box" id="reportLatestReason">
+              최신 분석 근거가 이곳에 표시됩니다.
+            </div>
+          </section>
+
+          <section class="report-section">
+            <div class="report-section-title">언어 특징 요약</div>
+            <div class="report-feature-list" id="reportFeatureList"></div>
+            <div class="report-recall-box">
+              <div class="report-recall-title">기억 회상 테스트</div>
+              <div class="report-recall-copy" id="reportRecallSummary">
+                아직 진행 중인 기억 테스트가 없습니다.
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <section class="report-section">
+          <div class="report-section-title">턴별 분석 기록</div>
+          <div class="report-turn-list" id="reportTurnList"></div>
+        </section>
+
+        <div class="report-modal-actions">
+          <button
+            id="printSessionReport"
+            class="record-btn secondary-btn"
+            type="button"
+          >
+            출력
+          </button>
+          <button
+            id="closeSessionReportFooter"
+            class="record-btn primary-btn"
+            type="button"
+          >
+            닫기
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div class="layout">
       <aside class="sidebar glass-panel">
         <div class="sidebar-header">
@@ -70,45 +200,62 @@
           </div>
         </div>
 
-        <div class="summary-grid">
-          <div class="mini-card glass-card">
-            <div class="mini-title">전체 평균</div>
-            <div class="mini-value" id="avgScore">0.0</div>
-          </div>
+        <details
+          class="panel-disclosure sidebar-disclosure glass-card"
+          id="sidebarMetricsDisclosure"
+        >
+          <summary class="panel-disclosure-summary">
+            <div class="panel-disclosure-copy">
+              <span class="panel-disclosure-kicker">보조 지표</span>
+              <strong>상세 지표 보기</strong>
+              <small>평균, 추세, 게이지, 시간별 점수 흐름</small>
+            </div>
+            <span class="panel-disclosure-icon" aria-hidden="true"></span>
+          </summary>
+          <div class="panel-disclosure-body">
+            <div class="summary-grid">
+              <div class="mini-card glass-card">
+                <div class="mini-title">전체 평균</div>
+                <div class="mini-value" id="avgScore">0.0</div>
+              </div>
 
-          <div class="mini-card glass-card">
-            <div class="mini-title">최근 5회 평균</div>
-            <div class="mini-value" id="recentAvgScore">0.0</div>
-          </div>
+              <div class="mini-card glass-card">
+                <div class="mini-title">최근 5회 평균</div>
+                <div class="mini-value" id="recentAvgScore">0.0</div>
+              </div>
 
-          <div class="mini-card glass-card">
-            <div class="mini-title">최근 점수</div>
-            <div class="mini-value" id="latestScore">0</div>
-          </div>
+              <div class="mini-card glass-card">
+                <div class="mini-title">최근 점수</div>
+                <div class="mini-value" id="latestScore">0</div>
+              </div>
 
-          <div class="mini-card glass-card">
-            <div class="mini-title">추세</div>
-            <div class="mini-value trend-text" id="trendText">데이터 부족</div>
-          </div>
-        </div>
+              <div class="mini-card glass-card">
+                <div class="mini-title">추세</div>
+                <div class="mini-value trend-text" id="trendText">
+                  데이터 부족
+                </div>
+              </div>
+            </div>
 
-        <div class="chart-card glass-card gauge-card">
-          <div class="card-title">누적 위험도 게이지</div>
-          <div class="gauge-wrap">
-            <canvas id="gaugeChart"></canvas>
-            <div class="gauge-center">
-              <div id="gaugeScore">0</div>
-              <span>점</span>
+            <div class="chart-card glass-card gauge-card">
+              <div class="card-title">누적 위험도 게이지</div>
+              <div class="gauge-wrap">
+                <canvas id="gaugeChart"></canvas>
+                <div class="gauge-center">
+                  <div id="gaugeScore">0</div>
+                  <span>점</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="chart-card glass-card trend-card">
+              <div class="card-title">시간별 점수 추이</div>
+              <div class="trend-chart-wrap">
+                <canvas id="scoreChart"></canvas>
+              </div>
             </div>
           </div>
-        </div>
-
-        <div class="chart-card glass-card trend-card">
-          <div class="card-title">시간별 점수 추이</div>
-          <div class="trend-chart-wrap">
-            <canvas id="scoreChart"></canvas>
-          </div>
-        </div>
+        </details>
       </aside>
 
       <main class="main">
@@ -227,6 +374,98 @@
                 </div>
               </div>
 
+              <div
+                id="analysisSummaryToast"
+                class="analysis-summary-toast hidden"
+                aria-live="polite"
+              >
+                <div class="analysis-summary-toast-head">
+                  <span class="analysis-summary-toast-kicker">분석 완료</span>
+                  <span
+                    class="analysis-summary-toast-badge"
+                    id="summaryToastBadge"
+                    >최신 분석</span
+                  >
+                </div>
+                <div
+                  class="analysis-summary-toast-title"
+                  id="summaryToastTitle"
+                >
+                  최신 분석 결과가 반영되었습니다.
+                </div>
+                <div class="analysis-summary-toast-grid">
+                  <div class="analysis-summary-toast-item">
+                    <span>총점</span>
+                    <strong id="summaryToastScore">0</strong>
+                  </div>
+                  <div class="analysis-summary-toast-item">
+                    <span>위험도</span>
+                    <strong id="summaryToastRisk">-</strong>
+                  </div>
+                  <div class="analysis-summary-toast-item">
+                    <span>추세</span>
+                    <strong id="summaryToastTrend">-</strong>
+                  </div>
+                </div>
+                <div
+                  class="analysis-summary-toast-reason"
+                  id="summaryToastReason"
+                >
+                  분석 근거가 이곳에 표시됩니다.
+                </div>
+              </div>
+
+              <div class="workspace-overview" id="workspaceOverview">
+                <div class="workspace-overview-card is-primary">
+                  <div class="workspace-overview-label">현재 상태</div>
+                  <div
+                    class="workspace-overview-value"
+                    id="workspaceOverviewState"
+                  >
+                    분석 준비 완료
+                  </div>
+                  <div
+                    class="workspace-overview-copy"
+                    id="workspaceOverviewCopy"
+                  >
+                    녹음을 시작하면 답변과 역할별 분석 흐름이 이 영역에
+                    요약됩니다.
+                  </div>
+                </div>
+
+                <div class="workspace-overview-card">
+                  <div class="workspace-overview-label">최신 분석</div>
+                  <div
+                    class="workspace-overview-value"
+                    id="workspaceOverviewLatest"
+                  >
+                    아직 분석 기록 없음
+                  </div>
+                  <div
+                    class="workspace-overview-copy"
+                    id="workspaceOverviewLatestMeta"
+                  >
+                    최신 점수와 위험도, 추세가 이곳에 요약됩니다.
+                  </div>
+                </div>
+
+                <div class="workspace-overview-card">
+                  <div class="workspace-overview-label">기억 회상 테스트</div>
+                  <div
+                    class="workspace-overview-value"
+                    id="workspaceOverviewRecall"
+                  >
+                    대기
+                  </div>
+                  <div
+                    class="workspace-overview-copy"
+                    id="workspaceOverviewRecallMeta"
+                  >
+                    현재 회상 테스트 상태와 최근 결과를 함께 보여줍니다.
+                  </div>
+                </div>
+              </div>
+
               <div class="process-panel">
                 <div class="process-head">
                   <span class="process-title">처리 단계</span>
@@ -241,11 +480,29 @@
                   </div>
                   <div class="process-step" data-step="render">화면 반영</div>
                 </div>
+                <div class="process-role-track" id="analysisRoleTrack">
+                  <div class="process-role-chip" data-role="repetition">
+                    <span>질문 반복</span>
+                    <small>대기</small>
+                  </div>
+                  <div class="process-role-chip" data-role="memory">
+                    <span>기억 혼란</span>
+                    <small>대기</small>
+                  </div>
+                  <div class="process-role-chip" data-role="time_confusion">
+                    <span>시간 / 상황 혼란</span>
+                    <small>대기</small>
+                  </div>
+                  <div class="process-role-chip" data-role="incoherence">
+                    <span>문장 비논리성</span>
+                    <small>대기</small>
+                  </div>
+                </div>
               </div>
 
               <div id="chatWindow" class="chat-window">
                 <div class="chat-empty-state" id="chatEmptyState">
-                  <div class="chat-empty-kicker">Ready For Analysis</div>
+                  <div class="chat-empty-kicker">분석 준비 완료</div>
                   <h4>아직 대화 기록이 없습니다.</h4>
                   <p>
                     녹음을 시작하면 답변과 위험도 분석이 이곳에 차례대로
@@ -274,138 +531,296 @@
               >
                 기록 초기화
               </button>
+              <button
+                id="openSessionReport"
+                class="record-btn secondary-btn"
+                type="button"
+              >
+                세션 리포트
+              </button>
             </div>
           </section>
 
           <aside class="analysis-side">
             <div class="analysis-panel-right">
-              <div class="analysis-card glass-card">
-                <div class="analysis-title-row">
-                  <div class="analysis-title">AI 분석 결과</div>
+              <div class="analysis-card glass-card analysis-hero-card">
+                <div class="analysis-title-row analysis-hero-head">
+                  <div class="analysis-title">세션 요약</div>
                   <span
                     class="analysis-state-badge is-idle"
-                    id="analysisStateBadge"
+                    id="analysisHeroBadge"
                     >대기</span
                   >
                 </div>
-                <div class="analysis-empty-hint" id="analysisEmptyHint">
-                  아직 분석 전입니다. 대화를 시작하면 판단, 점수, 근거가 이곳에
-                  표시됩니다.
+                <div class="analysis-hero-grid">
+                  <div class="analysis-hero-score-panel">
+                    <div class="analysis-hero-score-label">최신 반영 점수</div>
+                    <div
+                      class="analysis-hero-score-value"
+                      id="analysisHeroScore"
+                    >
+                      -
+                    </div>
+                    <div
+                      class="analysis-hero-score-copy"
+                      id="analysisHeroTimestamp"
+                    >
+                      아직 분석된 대화가 없습니다.
+                    </div>
+                  </div>
+                  <div class="analysis-hero-metrics">
+                    <div class="analysis-hero-metric">
+                      <span>위험도</span>
+                      <strong id="analysisHeroRisk">분석 전</strong>
+                    </div>
+                    <div class="analysis-hero-metric">
+                      <span>추세</span>
+                      <strong id="analysisHeroTrend">-</strong>
+                    </div>
+                    <div class="analysis-hero-metric">
+                      <span>모드</span>
+                      <strong id="analysisHeroMode">로컬 모델</strong>
+                    </div>
+                  </div>
                 </div>
+                <div class="analysis-hero-summary" id="analysisHeroSummary">
+                  대화를 시작하면 최신 분석 요약이 이곳에 고정되어 표시됩니다.
+                </div>
+              </div>
 
-                <div class="analysis-grid">
-                  <div class="analysis-row">
-                    <span class="analysis-label">판단</span>
-                    <span class="analysis-value" id="analysisJudgment"
-                      >대기</span
+              <details
+                class="panel-disclosure right-disclosure history-disclosure"
+                id="historyDisclosure"
+              >
+                <summary class="panel-disclosure-summary">
+                  <div class="panel-disclosure-copy">
+                    <span class="panel-disclosure-kicker">과거 기록</span>
+                    <strong>턴 타임라인 / 리포트 펼치기</strong>
+                    <small
+                      >과거 대화 흐름과 세션 리포트를 필요할 때만
+                      확인합니다.</small
                     >
                   </div>
-
-                  <div class="analysis-row">
-                    <span class="analysis-label">의심 점수</span>
-                    <span class="analysis-value" id="analysisScore">-</span>
+                  <span class="panel-disclosure-icon" aria-hidden="true"></span>
+                </summary>
+                <div class="panel-disclosure-body">
+                  <div class="analysis-card glass-card timeline-card">
+                    <div class="analysis-title-row">
+                      <div class="analysis-title">턴 타임라인</div>
+                      <span class="analysis-timeline-meta" id="timelineMeta"
+                        >기록 없음</span
+                      >
+                    </div>
+                    <div class="analysis-timeline-spark-card">
+                      <div class="analysis-timeline-spark-head">
+                        <div>
+                          <div class="analysis-timeline-spark-label">
+                            최근 반영 점수 흐름
+                          </div>
+                          <div
+                            class="analysis-timeline-spark-copy"
+                            id="timelineTrendCopy"
+                          >
+                            최근 반영 점수가 2건 이상 쌓이면 흐름을 함께
+                            보여줍니다.
+                          </div>
+                        </div>
+                        <span
+                          class="analysis-state-badge analysis-timeline-trend-badge is-idle"
+                          id="timelineTrendBadge"
+                          >데이터 부족</span
+                        >
+                      </div>
+                      <div
+                        class="analysis-timeline-sparkline"
+                        id="timelineSparkline"
+                      >
+                        <div class="analysis-timeline-sparkline-empty">
+                          반영된 점수가 누적되면 이곳에 최근 흐름이 표시됩니다.
+                        </div>
+                      </div>
+                    </div>
+                    <div class="analysis-timeline-list" id="turnTimelineList">
+                      <div class="analysis-timeline-empty">
+                        아직 누적된 대화가 없습니다. 녹음을 시작하면 턴별 점수
+                        흐름이 여기에 쌓입니다.
+                      </div>
+                    </div>
                   </div>
+                </div>
+              </details>
 
-                  <div class="analysis-row">
-                    <span class="analysis-label">위험도</span>
-                    <span class="analysis-value" id="analysisRiskLevel"
-                      >분석 전</span
+              <details
+                class="panel-disclosure right-disclosure detail-disclosure"
+                id="analysisDetailDisclosure"
+              >
+                <summary class="panel-disclosure-summary">
+                  <div class="panel-disclosure-copy">
+                    <span class="panel-disclosure-kicker">세부 분석</span>
+                    <strong>언어 특징 / 신뢰도 펼치기</strong>
+                    <small
+                      >세부 점수 분해, 분석 신뢰도, 레이더 차트를
+                      확인합니다.</small
                     >
                   </div>
+                  <span class="panel-disclosure-icon" aria-hidden="true"></span>
+                </summary>
+                <div class="panel-disclosure-body">
+                  <div class="analysis-card glass-card">
+                    <div class="analysis-title-row">
+                      <div class="analysis-title">AI 분석 결과</div>
+                      <span
+                        class="analysis-state-badge is-idle"
+                        id="analysisStateBadge"
+                        >대기</span
+                      >
+                    </div>
+                    <div class="analysis-empty-hint" id="analysisEmptyHint">
+                      아직 분석 전입니다. 대화를 시작하면 판단, 점수, 근거가
+                      이곳에 표시됩니다.
+                    </div>
 
-                  <div class="analysis-row">
-                    <span class="analysis-label">추세</span>
-                    <span class="analysis-value" id="analysisTrend">-</span>
+                    <div class="analysis-grid">
+                      <div class="analysis-row">
+                        <span class="analysis-label">판단</span>
+                        <span class="analysis-value" id="analysisJudgment"
+                          >대기</span
+                        >
+                      </div>
+
+                      <div class="analysis-row">
+                        <span class="analysis-label">의심 점수</span>
+                        <span class="analysis-value" id="analysisScore">-</span>
+                      </div>
+
+                      <div class="analysis-row">
+                        <span class="analysis-label">위험도</span>
+                        <span class="analysis-value" id="analysisRiskLevel"
+                          >분석 전</span
+                        >
+                      </div>
+
+                      <div class="analysis-row">
+                        <span class="analysis-label">추세</span>
+                        <span class="analysis-value" id="analysisTrend">-</span>
+                      </div>
+                    </div>
+
+                    <div class="analysis-reason">
+                      <div class="analysis-label reason-label">근거</div>
+                      <div class="analysis-reason-box" id="analysisReason">
+                        아직 분석 결과가 없습니다.
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="analysis-card glass-card">
+                    <div class="analysis-title">언어 특징 점수 분해</div>
+
+                    <div class="feature-item">
+                      <div class="feature-head">
+                        <span>질문 반복</span>
+                        <span id="featureRepetitionValue">0</span>
+                      </div>
+                      <div class="feature-bar">
+                        <div
+                          id="featureRepetitionBar"
+                          class="feature-fill"
+                        ></div>
+                      </div>
+                    </div>
+
+                    <div class="feature-item">
+                      <div class="feature-head">
+                        <span>기억 혼란</span>
+                        <span id="featureMemoryValue">0</span>
+                      </div>
+                      <div class="feature-bar">
+                        <div id="featureMemoryBar" class="feature-fill"></div>
+                      </div>
+                    </div>
+
+                    <div class="feature-item">
+                      <div class="feature-head">
+                        <span>시간 / 상황 혼란</span>
+                        <span id="featureTimeValue">0</span>
+                      </div>
+                      <div class="feature-bar">
+                        <div id="featureTimeBar" class="feature-fill"></div>
+                      </div>
+                    </div>
+
+                    <div class="feature-item">
+                      <div class="feature-head">
+                        <span>문장 비논리성</span>
+                        <span id="featureIncoherenceValue">0</span>
+                      </div>
+                      <div class="feature-bar">
+                        <div
+                          id="featureIncoherenceBar"
+                          class="feature-fill"
+                        ></div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="analysis-card glass-card">
+                    <div class="analysis-title">분석 신뢰도</div>
+                    <div class="confidence-box">
+                      <div class="confidence-score" id="confidenceScore">-</div>
+                      <div class="confidence-desc">분석 신뢰도</div>
+                    </div>
+                  </div>
+
+                  <div class="analysis-card glass-card radar-card">
+                    <div class="analysis-title">언어 특징 레이더</div>
+                    <div class="radar-chart-wrap">
+                      <canvas id="radarChart"></canvas>
+                    </div>
                   </div>
                 </div>
+              </details>
 
-                <div class="analysis-reason">
-                  <div class="analysis-label reason-label">근거</div>
-                  <div class="analysis-reason-box" id="analysisReason">
-                    아직 분석 결과가 없습니다.
+              <details
+                class="panel-disclosure right-disclosure recall-disclosure"
+                id="recallDisclosure"
+              >
+                <summary class="panel-disclosure-summary">
+                  <div class="panel-disclosure-copy">
+                    <span class="panel-disclosure-kicker">회상 검사</span>
+                    <strong>기억 회상 테스트 펼치기</strong>
+                    <small
+                      >진행 중일 때 자동으로 열리고, 평소에는 접혀
+                      있습니다.</small
+                    >
+                  </div>
+                  <span class="panel-disclosure-icon" aria-hidden="true"></span>
+                </summary>
+                <div class="panel-disclosure-body">
+                  <div class="analysis-card glass-card recall-card">
+                    <div class="analysis-title">기억 회상 테스트</div>
+
+                    <div class="analysis-row">
+                      <span class="analysis-label">상태</span>
+                      <span class="analysis-value" id="recallStatus">대기</span>
+                    </div>
+
+                    <div class="analysis-row">
+                      <span class="analysis-label">최근 결과</span>
+                      <span class="analysis-value" id="recallLastResult"
+                        >없음</span
+                      >
+                    </div>
+
+                    <div class="analysis-reason">
+                      <div class="analysis-label reason-label">안내</div>
+                      <div class="analysis-reason-box" id="recallPrompt">
+                        아직 진행 중인 기억 테스트가 없습니다.
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
-
-              <div class="analysis-card glass-card">
-                <div class="analysis-title">언어 특징 점수 분해</div>
-
-                <div class="feature-item">
-                  <div class="feature-head">
-                    <span>질문 반복</span>
-                    <span id="featureRepetitionValue">0</span>
-                  </div>
-                  <div class="feature-bar">
-                    <div id="featureRepetitionBar" class="feature-fill"></div>
-                  </div>
-                </div>
-
-                <div class="feature-item">
-                  <div class="feature-head">
-                    <span>기억 혼란</span>
-                    <span id="featureMemoryValue">0</span>
-                  </div>
-                  <div class="feature-bar">
-                    <div id="featureMemoryBar" class="feature-fill"></div>
-                  </div>
-                </div>
-
-                <div class="feature-item">
-                  <div class="feature-head">
-                    <span>시간 / 상황 혼란</span>
-                    <span id="featureTimeValue">0</span>
-                  </div>
-                  <div class="feature-bar">
-                    <div id="featureTimeBar" class="feature-fill"></div>
-                  </div>
-                </div>
-
-                <div class="feature-item">
-                  <div class="feature-head">
-                    <span>문장 비논리성</span>
-                    <span id="featureIncoherenceValue">0</span>
-                  </div>
-                  <div class="feature-bar">
-                    <div id="featureIncoherenceBar" class="feature-fill"></div>
-                  </div>
-                </div>
-              </div>
-
-              <div class="analysis-card glass-card">
-                <div class="analysis-title">AI Confidence</div>
-                <div class="confidence-box">
-                  <div class="confidence-score" id="confidenceScore">-</div>
-                  <div class="confidence-desc">분석 신뢰도</div>
-                </div>
-              </div>
-
-              <div class="analysis-card glass-card radar-card">
-                <div class="analysis-title">언어 특징 Radar</div>
-                <div class="radar-chart-wrap">
-                  <canvas id="radarChart"></canvas>
-                </div>
-              </div>
-
-              <div class="analysis-card glass-card recall-card">
-                <div class="analysis-title">Recall Memory Test</div>
-
-                <div class="analysis-row">
-                  <span class="analysis-label">상태</span>
-                  <span class="analysis-value" id="recallStatus">대기</span>
-                </div>
-
-                <div class="analysis-row">
-                  <span class="analysis-label">최근 결과</span>
-                  <span class="analysis-value" id="recallLastResult">없음</span>
-                </div>
-
-                <div class="analysis-reason">
-                  <div class="analysis-label reason-label">안내</div>
-                  <div class="analysis-reason-box" id="recallPrompt">
-                    아직 진행 중인 기억 테스트가 없습니다.
-                  </div>
-                </div>
-              </div>
+              </details>
             </div>
           </aside>
         </section>

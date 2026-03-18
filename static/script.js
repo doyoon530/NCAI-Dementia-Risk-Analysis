@@ -212,6 +212,13 @@ const analysisRoleLabels = {
 const urlParams = new URLSearchParams(window.location.search);
 const demoMode = normalizeText(urlParams.get("demo"));
 const isDemoMode = Boolean(demoMode);
+const captureMode = normalizeText(urlParams.get("capture"));
+const isDocsCapture = captureMode === "docs";
+
+if (isDocsCapture) {
+  document.body.classList.add("is-docs-capture");
+  document.body.dataset.captureMode = captureMode;
+}
 
 function clearScoreCascadeTimers() {
   scoreCascadeTimers.forEach((timerId) => window.clearTimeout(timerId));

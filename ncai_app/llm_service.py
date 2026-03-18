@@ -13,6 +13,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from . import runtime
 from .common import normalize_text
 from .config import (
+    ANSWER_STOP_SEQUENCES,
     DEFAULT_GOOGLE_KEY_PATH,
     ROLE_ANALYSIS_META,
     ROLE_ANALYSIS_PROMPTS,
@@ -166,7 +167,11 @@ def extract_api_message_text(content) -> str:
 
 
 def invoke_api_chat_completion(
-    messages: list[dict], model: str, temperature: float = 0.0, max_tokens: int = 256
+    messages: list[dict],
+    model: str,
+    temperature: float = 0.0,
+    max_tokens: int = 256,
+    stop: list[str] | None = None,
 ) -> str:
     api_key = os.getenv("API_LLM_API_KEY", "").strip()
     if not api_key:
@@ -185,6 +190,8 @@ def invoke_api_chat_completion(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if stop:
+        payload["stop"] = stop
 
     request_obj = urllib.request.Request(
         endpoint,
@@ -197,7 +204,9 @@ def invoke_api_chat_completion(
     )
 
     try:
-        with urllib.request.urlopen(request_obj, timeout=get_api_llm_timeout()) as response:
+        with urllib.request.urlopen(
+            request_obj, timeout=get_api_llm_timeout()
+        ) as response:
             response_payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         error_body = ""
@@ -223,6 +232,7 @@ def invoke_api_prompt(
     model_kind: str,
     temperature: float = 0.0,
     max_tokens: int = 256,
+    stop: list[str] | None = None,
 ) -> dict:
     model = (
         get_api_llm_answer_model()
@@ -236,6 +246,7 @@ def invoke_api_prompt(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            stop=stop,
         )
     }
 
@@ -256,6 +267,7 @@ def get_or_create_answer_chain():
         top_p=0.9,
         max_tokens=256,
         n_ctx=4096,
+        stop=ANSWER_STOP_SEQUENCES,
         verbose=False,
     )
     runtime.answer_chain = LLMChain(prompt=answer_prompt, llm=answer_llm)
@@ -320,7 +332,10 @@ def get_or_create_repetition_chain():
 
 
 def get_or_create_feature_analysis_chains():
-    if runtime.analysis_feature_chain is None or runtime.analysis_feature_retry_chain is None:
+    if (
+        runtime.analysis_feature_chain is None
+        or runtime.analysis_feature_retry_chain is None
+    ):
         get_or_create_analysis_chains()
     return runtime.analysis_feature_chain, runtime.analysis_feature_retry_chain
 

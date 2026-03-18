@@ -467,6 +467,83 @@ body::after {
     color: var(--accent-soft);
 }
 
+.mode-card {
+    margin: 0 0 18px;
+    padding: 16px;
+}
+
+.mode-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 14px;
+}
+
+.mode-card-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+.mode-card-status {
+    font-size: 18px;
+    font-weight: 800;
+    color: #f8fbff;
+    letter-spacing: -0.03em;
+}
+
+.mode-card-hint {
+    margin-top: 12px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-sub);
+}
+
+.mode-toggle {
+    display: inline-flex;
+    gap: 6px;
+    padding: 4px;
+    border-radius: 999px;
+    background: rgba(8, 18, 36, 0.78);
+    border: 1px solid rgba(74, 113, 166, 0.28);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.mode-toggle-btn {
+    min-width: 72px;
+    border: 0;
+    border-radius: 999px;
+    padding: 9px 14px;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--text-sub);
+    background: transparent;
+    cursor: pointer;
+    transition: background 0.18s ease, color 0.18s ease, transform 0.18s ease, opacity 0.18s ease;
+}
+
+.mode-toggle-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    color: #eef7ff;
+}
+
+.mode-toggle-btn.is-active {
+    background: linear-gradient(145deg, rgba(14, 59, 113, 0.94), rgba(53, 140, 242, 0.88));
+    color: #ffffff;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.14),
+        0 10px 22px rgba(10, 32, 68, 0.34);
+}
+
+.mode-toggle-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.42;
+}
+
 .status-card {
     border-radius: var(--radius-lg);
     padding: 22px;
@@ -1158,6 +1235,7 @@ body::after {
     flex: 0 0 auto;
     width: 100%;
     padding: 0;
+    grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
 }
 
 .record-btn {
@@ -1203,6 +1281,16 @@ body::after {
 
 .danger-btn {
     background: linear-gradient(145deg, rgba(112, 19, 44, 0.98), rgba(232, 79, 104, 0.9));
+    color: #fff;
+}
+
+.record-btn.is-recording {
+    background: linear-gradient(145deg, rgba(112, 19, 44, 0.98), rgba(232, 79, 104, 0.9));
+    color: #fff;
+}
+
+.record-btn.is-processing {
+    background: linear-gradient(145deg, rgba(43, 54, 76, 0.96), rgba(84, 101, 133, 0.78));
     color: #fff;
 }
 

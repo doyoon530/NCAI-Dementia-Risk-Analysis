@@ -4,15 +4,11 @@ from difflib import SequenceMatcher
 from .common import clamp_score, clamp_subscore, normalize_text, validate_user_text
 from .config import (
     MAX_ANALYSIS_RETRY,
-    MEMORY_MILD_PATTERNS,
-    MEMORY_STRONG_PATTERNS,
     REPETITION_SCORE_OPTIONS,
     ROLE_ANALYSIS_META,
     ROLE_ANALYSIS_ORDER,
     ROLE_ANALYSIS_PROMPTS,
     ROLE_ANALYSIS_RETRY_PROMPTS,
-    TIME_CONFUSION_PATTERNS,
-    TIME_REFERENCE_PATTERNS,
     answer_prompt,
     get_analysis_max_tokens,
     get_default_llm_provider,
@@ -28,9 +24,7 @@ from .history_service import (
     should_include_analysis_score,
 )
 from .llm_service import (
-    get_or_create_analysis_chains,
     get_or_create_answer_chain,
-    get_or_create_feature_analysis_chains,
     get_or_create_repetition_chain,
     get_or_create_role_analysis_chains,
     invoke_api_prompt,
@@ -149,59 +143,6 @@ def build_repetition_reason(
     return f"이전 질문 '{reference}'과 표현이 일부 겹쳐 질문 반복 가능성이 약하게 관찰됩니다."
 
 
-def contains_any_pattern(text: str, patterns) -> bool:
-    if not text:
-        return False
-
-    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-
-
-def detect_language_feature_signal(question: str) -> dict:
-    normalized_question = normalize_text(question)
-    if not normalized_question:
-        return {
-            "memory": 0,
-            "time_confusion": 0,
-            "incoherence": 0,
-            "reason": "",
-        }
-
-    memory_score = 0
-    time_confusion_score = 0
-    observations = []
-
-    if contains_any_pattern(normalized_question, MEMORY_STRONG_PATTERNS):
-        memory_score = 15
-        observations.append(
-            "질문에 '기억이 안 나', '까먹었다'처럼 기억 회상을 직접 어려워하는 표현이 포함되어 기억 혼란 신호가 관찰됩니다."
-        )
-    elif contains_any_pattern(normalized_question, MEMORY_MILD_PATTERNS):
-        memory_score = 8
-        observations.append(
-            "질문 표현에서 기억을 바로 떠올리지 못하거나 혼동하는 모습이 약하게 관찰됩니다."
-        )
-
-    has_time_reference = contains_any_pattern(
-        normalized_question, TIME_REFERENCE_PATTERNS
-    )
-    has_time_confusion = contains_any_pattern(
-        normalized_question, TIME_CONFUSION_PATTERNS
-    )
-
-    if has_time_reference and has_time_confusion:
-        time_confusion_score = 12 if memory_score >= 15 else 8
-        observations.append(
-            "언제, 몇 시, 오늘 일정 같은 시간 정보를 바로 떠올리지 못하는 표현이 함께 나타나 시간·상황 혼란 신호도 관찰됩니다."
-        )
-
-    return {
-        "memory": memory_score,
-        "time_confusion": time_confusion_score,
-        "incoherence": 0,
-        "reason": " ".join(observations).strip(),
-    }
-
-
 def build_repetition_context(previous_turns) -> str:
     if not previous_turns:
         return "이전 사용자 질문 없음"
@@ -316,10 +257,6 @@ def merge_reason_text(existing_reason: str, extra_reason: str) -> str:
     return f"{normalized_extra} {normalized_existing}"
 
 
-def merge_repetition_reason(existing_reason: str, repetition_reason: str) -> str:
-    return merge_reason_text(existing_reason, repetition_reason)
-
-
 def detect_repetition_signal(
     question: str, previous_turns, use_llm: bool = True
 ) -> dict:
@@ -368,79 +305,6 @@ def detect_repetition_signal(
         best_result["matched_question"] = heuristic_result.get("matched_question", "")
 
     return best_result
-
-
-def apply_repetition_guardrail(question: str, fields: dict, previous_turns) -> dict:
-    if not fields or not previous_turns:
-        return fields
-
-    repetition_signal = detect_repetition_signal(question, previous_turns, use_llm=True)
-    current_repetition = clamp_subscore(
-        int(fields["feature_scores"].get("repetition", 0)), 25
-    )
-    boosted_repetition = max(current_repetition, repetition_signal.get("score", 0))
-
-    if boosted_repetition <= current_repetition:
-        return fields
-
-    fields["feature_scores"]["repetition"] = boosted_repetition
-    fields["score"] = clamp_score(
-        boosted_repetition
-        + int(fields["feature_scores"].get("memory", 0))
-        + int(fields["feature_scores"].get("time_confusion", 0))
-        + int(fields["feature_scores"].get("incoherence", 0))
-    )
-
-    if fields.get("judgment") != "판단 어려움":
-        fields["judgment"] = infer_judgment_from_score(fields["score"])
-
-    fields["reason"] = merge_reason_text(
-        fields.get("reason", ""), repetition_signal.get("reason", "")
-    )
-    return fields
-
-
-def apply_language_feature_guardrail(question: str, fields: dict) -> dict:
-    if not fields:
-        return fields
-
-    language_signal = detect_language_feature_signal(question)
-    feature_scores = fields.get("feature_scores", {})
-    updated = False
-
-    boost_targets = [
-        ("memory", 25),
-        ("time_confusion", 30),
-        ("incoherence", 20),
-    ]
-
-    for key, max_value in boost_targets:
-        current_value = clamp_subscore(int(feature_scores.get(key, 0)), max_value)
-        boosted_value = max(current_value, int(language_signal.get(key, 0)))
-        if boosted_value > current_value:
-            feature_scores[key] = boosted_value
-            updated = True
-
-    if not updated:
-        return fields
-
-    fields["feature_scores"] = feature_scores
-    fields["score"] = clamp_score(
-        int(feature_scores.get("repetition", 0))
-        + int(feature_scores.get("memory", 0))
-        + int(feature_scores.get("time_confusion", 0))
-        + int(feature_scores.get("incoherence", 0))
-    )
-
-    if fields.get("judgment") != "판단 어려움":
-        fields["judgment"] = infer_judgment_from_score(fields["score"])
-
-    fields["reason"] = merge_reason_text(
-        fields.get("reason", ""), language_signal.get("reason", "")
-    )
-    return fields
-
-
 def get_default_reason() -> str:
     return (
         "입력 문장에서 충분한 분석 근거를 안정적으로 생성하지 못했습니다. "
@@ -1212,82 +1076,6 @@ def normalize_role_results_payload(raw_results) -> dict:
         }
 
     return normalized
-
-
-def generate_analysis_with_retry(
-    question: str,
-    conversation_context: str = "이전 대화 없음",
-    max_attempts: int = MAX_ANALYSIS_RETRY,
-) -> str:
-    previous_response = ""
-    primary_chain, retry_chain = get_or_create_analysis_chains()
-
-    for attempt in range(max_attempts):
-        try:
-            if attempt == 0:
-                response = primary_chain.invoke(
-                    {"conversation_context": conversation_context, "question": question}
-                )
-            else:
-                response = retry_chain.invoke(
-                    {
-                        "conversation_context": conversation_context,
-                        "question": question,
-                        "previous_response": previous_response,
-                    }
-                )
-
-            raw_text = response.get("text", "").strip()
-            previous_response = raw_text
-
-            if is_analysis_format_complete(raw_text):
-                return force_analysis_format(raw_text)
-
-        except Exception as e:
-            print(f"[분석 재시도 {attempt + 1} 실패] {e}")
-
-    if previous_response:
-        return force_analysis_format(previous_response)
-
-    return get_analysis_fallback_text()
-
-
-def generate_feature_analysis_with_retry(
-    question: str,
-    conversation_context: str = "이전 대화 없음",
-    max_attempts: int = MAX_ANALYSIS_RETRY,
-) -> str:
-    previous_response = ""
-    primary_chain, retry_chain = get_or_create_feature_analysis_chains()
-
-    for attempt in range(max_attempts):
-        try:
-            if attempt == 0:
-                response = primary_chain.invoke(
-                    {"conversation_context": conversation_context, "question": question}
-                )
-            else:
-                response = retry_chain.invoke(
-                    {
-                        "conversation_context": conversation_context,
-                        "question": question,
-                        "previous_response": previous_response,
-                    }
-                )
-
-            raw_text = response.get("text", "").strip()
-            previous_response = raw_text
-
-            if is_feature_analysis_complete(raw_text):
-                return force_feature_analysis_format(raw_text)
-
-        except Exception as e:
-            print(f"[비반복 특징 분석 재시도 {attempt + 1} 실패] {e}")
-
-    if previous_response:
-        return force_feature_analysis_format(previous_response)
-
-    return get_feature_analysis_fallback_text()
 
 
 def build_short_input_result() -> dict:

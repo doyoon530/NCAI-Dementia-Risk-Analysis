@@ -26,6 +26,7 @@ def get_or_create_session_id() -> str:
     runtime.conversation_store.setdefault(session_id, [])
     runtime.score_store.setdefault(session_id, [])
     runtime.turn_store.setdefault(session_id, [])
+    runtime.session_generation_store.setdefault(session_id, 0)
     runtime.recall_store.setdefault(
         session_id,
         {
@@ -37,6 +38,57 @@ def get_or_create_session_id() -> str:
         },
     )
     return session_id
+
+
+def normalize_analysis_generation(value) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+
+    return max(0, parsed)
+
+
+def get_analysis_generation(session_id: str | None) -> int:
+    if not session_id:
+        return 0
+
+    return runtime.session_generation_store.setdefault(session_id, 0)
+
+
+def bump_analysis_generation(session_id: str | None) -> int:
+    if not session_id:
+        return 0
+
+    next_generation = get_analysis_generation(session_id) + 1
+    runtime.session_generation_store[session_id] = next_generation
+    return next_generation
+
+
+def get_requested_analysis_generation(payload=None):
+    raw_value = None
+
+    if isinstance(payload, dict):
+        raw_value = payload.get("analysis_generation")
+
+    if raw_value in {None, ""}:
+        raw_value = request.headers.get("X-Analysis-Generation")
+
+    if raw_value in {None, ""}:
+        return None
+
+    return normalize_analysis_generation(raw_value)
+
+
+def is_current_analysis_generation(
+    session_id: str | None, requested_generation
+) -> bool:
+    if requested_generation is None:
+        return True
+
+    return get_analysis_generation(session_id) == normalize_analysis_generation(
+        requested_generation
+    )
 
 
 def add_to_history(session_id: str, role: str, content: str) -> None:
@@ -162,7 +214,9 @@ def add_turn_history(
 
     runtime.turn_store[session_id].append(turn)
     if len(runtime.turn_store[session_id]) > MAX_SCORE_HISTORY:
-        runtime.turn_store[session_id] = runtime.turn_store[session_id][-MAX_SCORE_HISTORY:]
+        runtime.turn_store[session_id] = runtime.turn_store[session_id][
+            -MAX_SCORE_HISTORY:
+        ]
 
     turn["average_score"] = get_average_score(session_id)
     turn["recent_average_score"] = get_recent_average_score(session_id)
@@ -445,7 +499,9 @@ def get_risk_level_from_score(score: float) -> str:
 
 def get_score_trend(session_id: str, window: int = RECENT_WINDOW) -> str:
     history = get_score_history(session_id)
-    return calculate_trend_from_score_values([item["score"] for item in history], window)
+    return calculate_trend_from_score_values(
+        [item["score"] for item in history], window
+    )
 
 
 def get_recall_state(session_id: str) -> dict:
@@ -498,7 +554,10 @@ def maybe_advance_recall_test(session_id: str) -> str:
         )
         return state["prompt"]
 
-    if state["status"] == "memorize" and user_turn_count == state["introduced_turn"] + 1:
+    if (
+        state["status"] == "memorize"
+        and user_turn_count == state["introduced_turn"] + 1
+    ):
         state["status"] = "ask"
         state["prompt"] = "Recall Test: 제가 조금 전에 제시한 기억 단어가 무엇이었나요?"
         return state["prompt"]
@@ -538,6 +597,7 @@ def build_chat_response(
     return jsonify(
         {
             "session_id": session_id,
+            "analysis_generation": get_analysis_generation(session_id),
             "user_speech": user_speech,
             "sys_response": sys_response,
             "answer": answer,

@@ -150,6 +150,52 @@ The endpoint returns:
 ### Included config
 
 - `Dockerfile`
+- `deploy_azure.ps1`
+
+### Fast path
+
+Use the included PowerShell script if you want a repeatable Azure deployment flow:
+
+```powershell
+.\deploy_azure.ps1 `
+  -ResourceGroup ncai-rg `
+  -AcrName <globally-unique-acr-name> `
+  -WebAppName <globally-unique-webapp-name> `
+  -GoogleCredentialsFile .\stt-bot-489913-807430be631b.json `
+  -ModelDownloadUrl "https://<your-model-download-url>"
+```
+
+If you want to deploy with the local GGUF file already in this repository, use:
+
+```powershell
+.\deploy_azure.ps1 `
+  -ResourceGroup ncai-rg `
+  -AcrName <globally-unique-acr-name> `
+  -WebAppName <globally-unique-webapp-name> `
+  -GoogleCredentialsFile .\stt-bot-489913-807430be631b.json `
+  -BundleLocalModel
+```
+
+The script does the following:
+
+1. creates the resource group
+2. creates Azure Container Registry
+3. builds the Docker image in ACR
+4. creates a Linux App Service plan
+5. creates or updates the Web App with the container image
+6. enables managed identity and grants `AcrPull`
+7. injects runtime environment variables
+8. sets `/health` as the health check path
+
+Before you run it:
+
+- install Azure CLI
+- run `az login`
+- choose globally unique names for `AcrName` and `WebAppName`
+- provide either `-GoogleCredentialsFile` or `-GoogleCredentialsJson`
+- provide either `-ModelDownloadUrl` or place the GGUF model at `/home/models/...`
+- or use `-BundleLocalModel` to build the local GGUF file directly into the container image
+- use `P1mV3` or higher if the local GGUF model remains inside this architecture
 
 ### Azure CLI example
 
@@ -167,6 +213,8 @@ az webapp config appsettings set --resource-group ncai-rg --name <webapp-name> -
 
 - Upload the model to mounted storage or bake it into a private image
 - App Service custom containers work best when the model is provided through mounted storage or startup download
+- Set `WEBSITES_PORT=8000` when the container listens on port 8000
+- Set `WEBSITES_ENABLE_APP_SERVICE_STORAGE=true` to persist files in `/home`
 
 ---
 

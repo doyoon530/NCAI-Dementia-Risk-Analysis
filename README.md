@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/banner.png" alt="NCAI Capstone Banner" width="100%" />
+</p>
+
 # 음성 인식 치매 위험도 분석 시스템
 
 경상국립대학교 NCAI 기업형 캡스톤디자인 프로젝트로 개발한 음성 기반 인지 위험도 모니터링 시스템입니다.  
@@ -120,11 +124,7 @@ flowchart TD
 
 ## 8. 화면 구성
 
-### 8.1 전체 동작 화면
-
-#### 화면 예시
-
-![시스템 동작 GIF](docs/images/demo-flow.gif)
+### 8.1 화면 예시
 
 | 메인 화면                                                          | 녹음 진행                                                |
 | ------------------------------------------------------------------ | -------------------------------------------------------- |
@@ -145,7 +145,7 @@ flowchart TD
 
 #### 1. 누적 위험 상태 카드
 
-![누적 위험 상태 카드](docs/images/card-status-risk.png)
+![누적 위험 상태 카드](docs/images/card-status-risk.gif)
 
 현재 세션의 누적 위험 상태를 가장 먼저 보여주는 핵심 카드입니다.  
 상태명과 보조 설명을 함께 제시하여 전체 상태를 즉시 파악할 수 있도록 구성했습니다.
@@ -313,6 +313,3 @@ http://서버PC_IP:5000
 - 조재민
 - 김우성
 - 안재영
-<p align="center">
-  <img src="docs/images/banner.png" alt="NCAI Capstone Banner" width="100%" />
-</p>

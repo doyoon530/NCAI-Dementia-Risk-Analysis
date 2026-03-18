@@ -20,51 +20,6 @@ ANALYSIS_CONTEXT_TURNS = 3
 REPETITION_CONTEXT_TURNS = 4
 REPETITION_SCORE_OPTIONS = [0, 8, 15, 20, 25]
 
-MEMORY_STRONG_PATTERNS = [
-    r"기억이\s*안\s*나",
-    r"기억이\s*잘\s*안\s*나",
-    r"기억이\s*안\s*나네",
-    r"기억이\s*안\s*나요",
-    r"기억이\s*나지\s*않",
-    r"기억이\s*흐릿",
-    r"기억이\s*가물가물",
-    r"까먹",
-    r"잊어버",
-]
-MEMORY_MILD_PATTERNS = [
-    r"생각이\s*안\s*나",
-    r"헷갈",
-    r"잘\s*모르겠",
-]
-TIME_REFERENCE_PATTERNS = [
-    r"언제",
-    r"몇\s*시",
-    r"몇시",
-    r"시간",
-    r"날짜",
-    r"요일",
-    r"오늘",
-    r"어제",
-    r"내일",
-    r"오전",
-    r"오후",
-    r"수업",
-    r"회의",
-    r"약속",
-    r"일정",
-]
-TIME_CONFUSION_PATTERNS = [
-    r"언제였",
-    r"언제인지",
-    r"몇\s*시인지",
-    r"몇시인지",
-    r"모르겠",
-    r"헷갈",
-    r"기억이\s*안\s*나",
-    r"까먹",
-    r"잊어버",
-]
-
 RECALL_WORDS = [
     "사과",
     "버스",

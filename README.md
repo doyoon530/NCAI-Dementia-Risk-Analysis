@@ -214,6 +214,34 @@ Recall Memory Test는 일정 턴마다 자동으로 삽입됩니다.
 
 또한 녹음 중에는 채팅 패널 배경에 음성 시각화가 은은하게 나타나도록 하여, 사용자가 현재 시스템 상태를 쉽게 인지할 수 있도록 하였습니다.
 
+### 9.1 실제 동작 화면
+
+아래 이미지는 본 시스템의 실제 동작 흐름을 문서용 데모 상태로 자동 캡처한 결과입니다.
+
+#### 전체 동작 요약 GIF
+
+![시스템 동작 GIF](docs/images/demo-flow.gif)
+
+#### 메인 대시보드 화면
+
+![메인 대시보드](docs/images/01-overview.png)
+
+#### 음성 녹음 진행 화면
+
+![녹음 진행 화면](docs/images/02-recording-state.png)
+
+#### 답변 생성 및 분석 진행 화면
+
+![분석 진행 화면](docs/images/04-analysis-progress.png)
+
+#### 최종 분석 결과 화면
+
+![최종 분석 결과 화면](docs/images/05-final-dashboard.png)
+
+#### Recall Memory Test 화면
+
+![Recall Memory Test 화면](docs/images/06-recall-test.png)
+
 ---
 
 ## 10. 기대 효과
@@ -365,6 +393,24 @@ lint.bat
 ```bash
 npm run lint
 ```
+
+### 14.6 문서용 이미지 자동 생성
+
+README에 포함된 화면 이미지는 데모 상태를 기준으로 자동 생성할 수 있습니다.
+
+```bash
+npm run capture:docs
+```
+
+위 명령을 실행하면 다음 파일이 자동으로 생성됩니다.
+
+- `docs/images/01-overview.png`
+- `docs/images/02-recording-state.png`
+- `docs/images/03-answer-ready.png`
+- `docs/images/04-analysis-progress.png`
+- `docs/images/05-final-dashboard.png`
+- `docs/images/06-recall-test.png`
+- `docs/images/demo-flow.gif`
 
 ---
 

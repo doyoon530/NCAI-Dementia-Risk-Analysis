@@ -13,6 +13,8 @@ import random
 import socket
 import json
 import tempfile
+import urllib.request
+import urllib.error
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -34,6 +36,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 DEFAULT_MODEL_PATH = os.path.join(BASE_DIR, "models", "EXAONE-3.5-7.8B-Instruct-Q8_0.gguf")
 DEFAULT_GOOGLE_KEY_PATH = os.path.join(BASE_DIR, "stt-bot-489913-807430be631b.json")
+DEFAULT_API_LLM_BASE_URL = "https://api.openai.com/v1"
+SUPPORTED_LLM_PROVIDERS = {"local", "api"}
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -44,6 +48,50 @@ RECENT_WINDOW = 5
 ANALYSIS_CONTEXT_TURNS = 3
 REPETITION_CONTEXT_TURNS = 4
 REPETITION_SCORE_OPTIONS = [0, 8, 15, 20, 25]
+MEMORY_STRONG_PATTERNS = [
+    r"기억이\s*안\s*나",
+    r"기억이\s*잘\s*안\s*나",
+    r"기억이\s*안\s*나네",
+    r"기억이\s*안\s*나요",
+    r"기억이\s*나지\s*않",
+    r"기억이\s*흐릿",
+    r"기억이\s*가물가물",
+    r"까먹",
+    r"잊어버",
+]
+MEMORY_MILD_PATTERNS = [
+    r"생각이\s*안\s*나",
+    r"헷갈",
+    r"잘\s*모르겠",
+]
+TIME_REFERENCE_PATTERNS = [
+    r"언제",
+    r"몇\s*시",
+    r"몇시",
+    r"시간",
+    r"날짜",
+    r"요일",
+    r"오늘",
+    r"어제",
+    r"내일",
+    r"오전",
+    r"오후",
+    r"수업",
+    r"회의",
+    r"약속",
+    r"일정",
+]
+TIME_CONFUSION_PATTERNS = [
+    r"언제였",
+    r"언제인지",
+    r"몇\s*시인지",
+    r"몇시인지",
+    r"모르겠",
+    r"헷갈",
+    r"기억이\s*안\s*나",
+    r"까먹",
+    r"잊어버",
+]
 
 RECALL_WORDS = [
     "사과", "버스", "바다", "연필", "시계", "나무", "기차", "고양이",
@@ -62,8 +110,14 @@ answer_chain = None
 analysis_chain = None
 analysis_retry_chain = None
 analysis_repetition_chain = None
+analysis_feature_chain = None
+analysis_feature_retry_chain = None
+analysis_llm_instance = None
+role_analysis_chains = {}
+role_analysis_retry_chains = {}
 speech_client = None
 temp_google_credentials_path = None
+analysis_runtime_cache = {}
 
 
 # =========================
@@ -313,12 +367,264 @@ repetition_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
+feature_analysis_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """
+당신은 대화 기반 인지 위험 징후 분석기입니다.
+
+오직 기억 혼란, 시간/상황 혼란, 문장 비논리성만 평가하십시오.
+질문 반복 여부는 이미 별도 분석기가 담당하므로 여기서 점수화하지 마십시오.
+
+중요 규칙:
+- 질문에 답변하지 마십시오.
+- 조언하지 마십시오.
+- 같은 질문이 반복되더라도 반복 자체를 이유로 기억혼란점수, 시간혼란점수, 문장비논리점수를 올리지 마십시오.
+- 오직 현재 질문과 대화 맥락에서 실제로 드러난 기억 회상 어려움, 시간·상황 혼란, 문장 논리성만 평가하십시오.
+- 근거는 반드시 한국어 문장 2문장 이상으로 작성하십시오.
+- 형식 외 다른 문장을 출력하면 실패입니다.
+
+점수 범위:
+- 기억혼란점수: 0~25
+- 시간혼란점수: 0~30
+- 문장비논리점수: 0~20
+
+출력 형식:
+기억혼란점수:
+시간혼란점수:
+문장비논리점수:
+근거:
+"""
+        ),
+        (
+            "human",
+            """
+최근 대화 맥락:
+{conversation_context}
+
+현재 질문:
+{question}
+
+반드시 위 형식만 출력하세요.
+"""
+        )
+    ]
+)
+
+feature_analysis_retry_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """
+당신은 대화 기반 인지 위험 징후 분석기입니다.
+
+오직 기억 혼란, 시간/상황 혼란, 문장 비논리성만 평가하십시오.
+질문 반복 여부는 이미 별도 분석기가 담당하므로 여기서 점수화하지 마십시오.
+
+이전 응답은 형식이 잘못되었습니다.
+형식을 정확히 맞추고, 반복 질문이라는 이유만으로 다른 점수를 자동으로 올리지 마십시오.
+
+출력 형식:
+기억혼란점수:
+시간혼란점수:
+문장비논리점수:
+근거:
+"""
+        ),
+        (
+            "human",
+            """
+최근 대화 맥락:
+{conversation_context}
+
+현재 질문:
+{question}
+
+이전 응답:
+{previous_response}
+
+반드시 위 형식만 다시 출력하세요.
+"""
+        )
+    ]
+)
+
+
+ROLE_ANALYSIS_META = {
+    "memory": {
+        "title": "기억 혼란",
+        "score_label": "기억혼란점수",
+        "max_score": 25,
+        "focus_rule": "기억이 안 난다, 떠오르지 않는다, 방금 들은 내용을 바로 회상하지 못한다는 식의 기억 회상 어려움만 평가하십시오.",
+    },
+    "time_confusion": {
+        "title": "시간/상황 혼란",
+        "score_label": "시간혼란점수",
+        "max_score": 30,
+        "focus_rule": "언제, 몇 시, 오늘 일정, 현재 상황 같은 시간·상황 정보를 혼동하거나 바로 떠올리지 못하는 표현만 평가하십시오.",
+    },
+    "incoherence": {
+        "title": "문장 비논리성",
+        "score_label": "문장비논리점수",
+        "max_score": 20,
+        "focus_rule": "문장 전개가 비약적이거나 앞뒤 논리가 약한 경우만 평가하십시오.",
+    },
+}
+
+ROLE_ANALYSIS_ORDER = ["repetition", "memory", "time_confusion", "incoherence"]
+
+
+def normalize_role_key(role_key: str) -> str:
+    normalized = str(role_key or "").strip().lower()
+    aliases = {
+        "repetition": "repetition",
+        "memory": "memory",
+        "time_confusion": "time_confusion",
+        "time": "time_confusion",
+        "incoherence": "incoherence",
+    }
+    return aliases.get(normalized, "")
+
+
+def build_role_prompt(role_key: str) -> ChatPromptTemplate:
+    meta = ROLE_ANALYSIS_META[role_key]
+    return ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                f"""
+당신은 대화 기반 인지 위험 징후 분석기입니다.
+
+오직 {meta['title']}만 평가하십시오.
+질문 반복, 다른 역할 점수, 전체 판단은 여기서 평가하지 마십시오.
+
+평가 규칙:
+- 질문에 답변하지 마십시오.
+- 조언하지 마십시오.
+- {meta['focus_rule']}
+- 다른 특징이 보여도 {meta['title']}과 직접 관련이 없으면 점수에 반영하지 마십시오.
+- 근거는 반드시 한국어 문장 2문장 이상으로 작성하십시오.
+
+점수 범위:
+- {meta['score_label']}: 0~{meta['max_score']}
+
+출력 형식:
+{meta['score_label']}:
+근거:
+"""
+            ),
+            (
+                "human",
+                """
+최근 대화 맥락:
+{conversation_context}
+
+현재 질문:
+{question}
+
+반드시 위 형식만 출력하세요.
+"""
+            )
+        ]
+    )
+
+
+def build_role_retry_prompt(role_key: str) -> ChatPromptTemplate:
+    meta = ROLE_ANALYSIS_META[role_key]
+    return ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                f"""
+당신은 대화 기반 인지 위험 징후 분석기입니다.
+
+오직 {meta['title']}만 평가하십시오.
+이전 응답은 형식이 잘못되었습니다.
+
+중요:
+- 질문 반복이나 다른 점수는 고려하지 마십시오.
+- 형식 외 다른 문장을 출력하지 마십시오.
+
+출력 형식:
+{meta['score_label']}:
+근거:
+"""
+            ),
+            (
+                "human",
+                """
+최근 대화 맥락:
+{conversation_context}
+
+현재 질문:
+{question}
+
+이전 응답:
+{previous_response}
+
+반드시 위 형식만 다시 출력하세요.
+"""
+            )
+        ]
+    )
+
+
+ROLE_ANALYSIS_PROMPTS = {
+    role_key: build_role_prompt(role_key)
+    for role_key in ROLE_ANALYSIS_META
+}
+
+ROLE_ANALYSIS_RETRY_PROMPTS = {
+    role_key: build_role_retry_prompt(role_key)
+    for role_key in ROLE_ANALYSIS_META
+}
+
 
 # =========================
 # LLM 로드
 # =========================
 def get_model_path() -> str:
     return os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH)
+
+
+def normalize_llm_provider(provider: str | None) -> str:
+    normalized = normalize_text(str(provider or "")).lower()
+    if normalized == "api":
+        return "api"
+    return "local"
+
+
+def get_default_llm_provider() -> str:
+    return normalize_llm_provider(os.getenv("LLM_PROVIDER", "local"))
+
+
+def get_api_llm_base_url() -> str:
+    return os.getenv("API_LLM_BASE_URL", DEFAULT_API_LLM_BASE_URL).strip().rstrip("/")
+
+
+def get_api_llm_api_key() -> str:
+    return os.getenv("API_LLM_API_KEY", "").strip()
+
+
+def get_api_llm_answer_model() -> str:
+    return os.getenv("API_LLM_ANSWER_MODEL", "").strip()
+
+
+def get_api_llm_analysis_model() -> str:
+    return os.getenv("API_LLM_ANALYSIS_MODEL", "").strip() or get_api_llm_answer_model()
+
+
+def get_api_llm_timeout() -> int:
+    return get_positive_int_env("API_LLM_TIMEOUT", 60)
+
+
+def is_api_llm_configured() -> bool:
+    return bool(
+        get_api_llm_api_key()
+        and get_api_llm_answer_model()
+        and get_api_llm_analysis_model()
+    )
 
 
 def get_positive_int_env(name: str, default: int) -> int:
@@ -377,6 +683,160 @@ def setup_google_credentials() -> str | None:
     return None
 
 
+def get_requested_llm_provider(data=None) -> str:
+    requested = ""
+
+    if isinstance(data, dict):
+        requested = str(data.get("llm_provider", "") or "")
+
+    header_value = request.headers.get("X-LLM-Provider", "")
+    return normalize_llm_provider(requested or header_value or get_default_llm_provider())
+
+
+def get_llm_provider_status() -> dict:
+    model_status = get_model_status()
+    local_ready = bool(model_status["exists"])
+    api_ready = is_api_llm_configured()
+
+    return {
+        "default": get_default_llm_provider(),
+        "supported": sorted(SUPPORTED_LLM_PROVIDERS),
+        "local": {
+            "ready": local_ready,
+            "label": "로컬 모델",
+            "model_path": model_status["path"],
+            "model_exists": local_ready,
+        },
+        "api": {
+            "ready": api_ready,
+            "label": "외부 API",
+            "base_url": get_api_llm_base_url(),
+            "answer_model": get_api_llm_answer_model(),
+            "analysis_model": get_api_llm_analysis_model(),
+        },
+    }
+
+
+def flatten_prompt_message_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content or "")
+
+
+def build_api_chat_messages(prompt_template: ChatPromptTemplate, variables: dict) -> list[dict]:
+    messages = []
+    formatted_messages = prompt_template.format_messages(**variables)
+
+    for message in formatted_messages:
+        role = "user"
+        if message.type == "system":
+            role = "system"
+        elif message.type in {"ai", "assistant"}:
+            role = "assistant"
+
+        messages.append({
+            "role": role,
+            "content": flatten_prompt_message_content(message.content),
+        })
+
+    return messages
+
+
+def extract_api_message_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    return str(content or "")
+
+
+def invoke_api_chat_completion(
+    messages: list[dict],
+    model: str,
+    temperature: float = 0.0,
+    max_tokens: int = 256
+) -> str:
+    api_key = get_api_llm_api_key()
+    if not api_key:
+        raise RuntimeError("API 모드가 설정되지 않았습니다. API_LLM_API_KEY를 먼저 설정해주세요.")
+    if not model:
+        raise RuntimeError("API 모드가 설정되지 않았습니다. 사용할 모델 이름을 먼저 설정해주세요.")
+
+    endpoint = f"{get_api_llm_base_url()}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    request_obj = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request_obj, timeout=get_api_llm_timeout()) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        error_body = ""
+        try:
+            error_body = error.read().decode("utf-8")
+        except Exception:
+            error_body = str(error)
+        raise RuntimeError(f"외부 API 호출이 실패했습니다. {error_body}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError("외부 API 서버에 연결하지 못했습니다.") from error
+
+    choices = response_payload.get("choices") or []
+    if not choices:
+        raise RuntimeError("외부 API 응답에 choices가 없습니다.")
+
+    message = choices[0].get("message", {})
+    return extract_api_message_text(message.get("content", "")).strip()
+
+
+def invoke_api_prompt(
+    prompt_template: ChatPromptTemplate,
+    variables: dict,
+    model_kind: str,
+    temperature: float = 0.0,
+    max_tokens: int = 256
+) -> dict:
+    model = get_api_llm_answer_model() if model_kind == "answer" else get_api_llm_analysis_model()
+    messages = build_api_chat_messages(prompt_template, variables)
+    return {
+        "text": invoke_api_chat_completion(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    }
+
+
 def get_model_status() -> dict:
     model_path = get_model_path()
     return {
@@ -419,8 +879,15 @@ def get_or_create_answer_chain():
 
 def get_or_create_analysis_chains():
     global analysis_chain, analysis_retry_chain, analysis_repetition_chain
+    global analysis_feature_chain, analysis_feature_retry_chain, analysis_llm_instance
 
-    if analysis_chain is not None and analysis_retry_chain is not None and analysis_repetition_chain is not None:
+    if (
+        analysis_chain is not None
+        and analysis_retry_chain is not None
+        and analysis_repetition_chain is not None
+        and analysis_feature_chain is not None
+        and analysis_feature_retry_chain is not None
+    ):
         return analysis_chain, analysis_retry_chain
 
     model_path = get_model_path()
@@ -429,19 +896,27 @@ def get_or_create_analysis_chains():
             f"Model file not found: {model_path}. Set MODEL_PATH to a valid GGUF model path."
         )
 
-    analysis_llm = LlamaCpp(
-        model_path=model_path,
-        temperature=0.0,
-        top_p=0.9,
-        max_tokens=get_analysis_max_tokens(),
-        n_ctx=get_analysis_n_ctx(),
-        n_batch=get_analysis_n_batch(),
-        verbose=False,
-    )
+    if analysis_llm_instance is None:
+        analysis_llm_instance = LlamaCpp(
+            model_path=model_path,
+            temperature=0.0,
+            top_p=0.9,
+            max_tokens=get_analysis_max_tokens(),
+            n_ctx=get_analysis_n_ctx(),
+            n_batch=get_analysis_n_batch(),
+            verbose=False,
+        )
 
-    analysis_chain = LLMChain(prompt=analysis_prompt, llm=analysis_llm)
-    analysis_retry_chain = LLMChain(prompt=analysis_retry_prompt, llm=analysis_llm)
-    analysis_repetition_chain = LLMChain(prompt=repetition_prompt, llm=analysis_llm)
+    if analysis_chain is None:
+        analysis_chain = LLMChain(prompt=analysis_prompt, llm=analysis_llm_instance)
+    if analysis_retry_chain is None:
+        analysis_retry_chain = LLMChain(prompt=analysis_retry_prompt, llm=analysis_llm_instance)
+    if analysis_repetition_chain is None:
+        analysis_repetition_chain = LLMChain(prompt=repetition_prompt, llm=analysis_llm_instance)
+    if analysis_feature_chain is None:
+        analysis_feature_chain = LLMChain(prompt=feature_analysis_prompt, llm=analysis_llm_instance)
+    if analysis_feature_retry_chain is None:
+        analysis_feature_retry_chain = LLMChain(prompt=feature_analysis_retry_prompt, llm=analysis_llm_instance)
     return analysis_chain, analysis_retry_chain
 
 
@@ -452,6 +927,42 @@ def get_or_create_repetition_chain():
         get_or_create_analysis_chains()
 
     return analysis_repetition_chain
+
+
+def get_or_create_feature_analysis_chains():
+    global analysis_feature_chain, analysis_feature_retry_chain
+
+    if analysis_feature_chain is None or analysis_feature_retry_chain is None:
+        get_or_create_analysis_chains()
+
+    return analysis_feature_chain, analysis_feature_retry_chain
+
+
+def get_or_create_role_analysis_chains(role_key: str):
+    global role_analysis_chains, role_analysis_retry_chains, analysis_llm_instance
+
+    if role_key not in ROLE_ANALYSIS_META:
+        raise ValueError(f"Unsupported analysis role: {role_key}")
+
+    if role_key in role_analysis_chains and role_key in role_analysis_retry_chains:
+        return role_analysis_chains[role_key], role_analysis_retry_chains[role_key]
+
+    if analysis_llm_instance is None:
+        get_or_create_analysis_chains()
+
+    if role_key not in role_analysis_chains:
+        role_analysis_chains[role_key] = LLMChain(
+            prompt=ROLE_ANALYSIS_PROMPTS[role_key],
+            llm=analysis_llm_instance,
+        )
+
+    if role_key not in role_analysis_retry_chains:
+        role_analysis_retry_chains[role_key] = LLMChain(
+            prompt=ROLE_ANALYSIS_RETRY_PROMPTS[role_key],
+            llm=analysis_llm_instance,
+        )
+
+    return role_analysis_chains[role_key], role_analysis_retry_chains[role_key]
 
 
 def get_or_create_speech_client():
@@ -532,11 +1043,7 @@ def add_to_history(session_id: str, role: str, content: str) -> None:
         conversation_store[session_id] = conversation_store[session_id][-max_messages:]
 
 
-def build_analysis_context(session_id: str | None, max_turns: int = ANALYSIS_CONTEXT_TURNS) -> str:
-    if not session_id:
-        return "이전 대화 없음"
-
-    turns = turn_store.get(session_id, [])
+def build_analysis_context_from_turns(turns, max_turns: int = ANALYSIS_CONTEXT_TURNS) -> str:
     if not turns:
         return "이전 대화 없음"
 
@@ -564,6 +1071,14 @@ def build_analysis_context(session_id: str | None, max_turns: int = ANALYSIS_CON
     return "\n".join(context_lines)
 
 
+def build_analysis_context(session_id: str | None, max_turns: int = ANALYSIS_CONTEXT_TURNS) -> str:
+    if not session_id:
+        return "이전 대화 없음"
+
+    turns = turn_store.get(session_id, [])
+    return build_analysis_context_from_turns(turns, max_turns=max_turns)
+
+
 def get_recent_user_turns(turns, max_turns: int = REPETITION_CONTEXT_TURNS):
     if not turns:
         return []
@@ -583,6 +1098,29 @@ def get_recent_user_turns(turns, max_turns: int = REPETITION_CONTEXT_TURNS):
         recent_turns = recent_turns[-max_turns:]
 
     return recent_turns
+
+
+def get_analysis_runtime_state(session_id: str | None) -> dict:
+    if not session_id:
+        return {
+            "analysis_context": "이전 대화 없음",
+            "previous_turns": [],
+            "turn_count": 0,
+        }
+
+    turns = turn_store.get(session_id, [])
+    turn_count = len(turns)
+    cached = analysis_runtime_cache.get(session_id)
+    if cached and cached.get("turn_count") == turn_count:
+        return cached
+
+    runtime_state = {
+        "analysis_context": build_analysis_context_from_turns(turns),
+        "previous_turns": get_recent_user_turns(turns),
+        "turn_count": turn_count,
+    }
+    analysis_runtime_cache[session_id] = runtime_state
+    return runtime_state
 
 
 def normalize_similarity_text(text: str) -> str:
@@ -695,6 +1233,55 @@ def build_repetition_reason(score: int, matched_question: str, is_immediate: boo
     return f"이전 질문 '{reference}'과 표현이 일부 겹쳐 질문 반복 가능성이 약하게 관찰됩니다."
 
 
+def contains_any_pattern(text: str, patterns) -> bool:
+    if not text:
+        return False
+
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
+def detect_language_feature_signal(question: str) -> dict:
+    normalized_question = normalize_text(question)
+    if not normalized_question:
+        return {
+            "memory": 0,
+            "time_confusion": 0,
+            "incoherence": 0,
+            "reason": "",
+        }
+
+    memory_score = 0
+    time_confusion_score = 0
+    observations = []
+
+    if contains_any_pattern(normalized_question, MEMORY_STRONG_PATTERNS):
+        memory_score = 15
+        observations.append(
+            "질문에 '기억이 안 나', '까먹었다'처럼 기억 회상을 직접 어려워하는 표현이 포함되어 기억 혼란 신호가 관찰됩니다."
+        )
+    elif contains_any_pattern(normalized_question, MEMORY_MILD_PATTERNS):
+        memory_score = 8
+        observations.append(
+            "질문 표현에서 기억을 바로 떠올리지 못하거나 혼동하는 모습이 약하게 관찰됩니다."
+        )
+
+    has_time_reference = contains_any_pattern(normalized_question, TIME_REFERENCE_PATTERNS)
+    has_time_confusion = contains_any_pattern(normalized_question, TIME_CONFUSION_PATTERNS)
+
+    if has_time_reference and has_time_confusion:
+        time_confusion_score = 12 if memory_score >= 15 else 8
+        observations.append(
+            "언제, 몇 시, 오늘 일정 같은 시간 정보를 바로 떠올리지 못하는 표현이 함께 나타나 시간·상황 혼란 신호도 관찰됩니다."
+        )
+
+    return {
+        "memory": memory_score,
+        "time_confusion": time_confusion_score,
+        "incoherence": 0,
+        "reason": " ".join(observations).strip(),
+    }
+
+
 def build_repetition_context(previous_turns) -> str:
     if not previous_turns:
         return "이전 사용자 질문 없음"
@@ -793,18 +1380,22 @@ def parse_repetition_chain_response(response_text: str) -> dict:
     }
 
 
-def merge_repetition_reason(existing_reason: str, repetition_reason: str) -> str:
+def merge_reason_text(existing_reason: str, extra_reason: str) -> str:
     normalized_existing = normalize_text(existing_reason)
-    normalized_repetition = normalize_text(repetition_reason)
+    normalized_extra = normalize_text(extra_reason)
 
-    if not normalized_repetition:
+    if not normalized_extra:
         return normalized_existing
     if not normalized_existing:
-        return normalized_repetition
-    if normalized_repetition in normalized_existing:
+        return normalized_extra
+    if normalized_extra in normalized_existing:
         return normalized_existing
 
-    return f"{normalized_repetition} {normalized_existing}"
+    return f"{normalized_extra} {normalized_existing}"
+
+
+def merge_repetition_reason(existing_reason: str, repetition_reason: str) -> str:
+    return merge_reason_text(existing_reason, repetition_reason)
 
 
 def detect_repetition_signal(question: str, previous_turns, use_llm: bool = True) -> dict:
@@ -869,7 +1460,46 @@ def apply_repetition_guardrail(question: str, fields: dict, previous_turns) -> d
     if fields.get("judgment") != "판단 어려움":
         fields["judgment"] = infer_judgment_from_score(fields["score"])
 
-    fields["reason"] = merge_repetition_reason(fields.get("reason", ""), repetition_signal.get("reason", ""))
+    fields["reason"] = merge_reason_text(fields.get("reason", ""), repetition_signal.get("reason", ""))
+    return fields
+
+
+def apply_language_feature_guardrail(question: str, fields: dict) -> dict:
+    if not fields:
+        return fields
+
+    language_signal = detect_language_feature_signal(question)
+    feature_scores = fields.get("feature_scores", {})
+    updated = False
+
+    boost_targets = [
+        ("memory", 25),
+        ("time_confusion", 30),
+        ("incoherence", 20),
+    ]
+
+    for key, max_value in boost_targets:
+        current_value = clamp_subscore(int(feature_scores.get(key, 0)), max_value)
+        boosted_value = max(current_value, int(language_signal.get(key, 0)))
+        if boosted_value > current_value:
+            feature_scores[key] = boosted_value
+            updated = True
+
+    if not updated:
+        return fields
+
+    fields["feature_scores"] = feature_scores
+    fields["score"] = clamp_score(
+        int(feature_scores.get("repetition", 0))
+        + int(feature_scores.get("memory", 0))
+        + int(feature_scores.get("time_confusion", 0))
+        + int(feature_scores.get("incoherence", 0))
+    )
+
+    if fields.get("judgment") != "판단 어려움":
+        fields["judgment"] = infer_judgment_from_score(fields["score"])
+
+    fields["reason"] = merge_reason_text(fields.get("reason", ""), language_signal.get("reason", ""))
     return fields
 
 
@@ -883,7 +1513,8 @@ def add_turn_history(
     feature_scores: dict,
     follow_up_messages=None,
     score_included: bool = True,
-    excluded_reason: str = ""
+    excluded_reason: str = "",
+    llm_provider: str = "local"
 ) -> dict:
     turn_store.setdefault(session_id, [])
 
@@ -904,6 +1535,7 @@ def add_turn_history(
         "follow_up_messages": follow_up_messages or [],
         "score_included": bool(score_included),
         "excluded_reason": str(excluded_reason or ""),
+        "llm_provider": normalize_llm_provider(llm_provider),
     }
 
     turn_store[session_id].append(turn)
@@ -960,11 +1592,6 @@ def repair_session_analysis_history(session_id: str) -> None:
             "incoherence": clamp_subscore(int(feature_scores.get("incoherence", 0)), 20),
         }
 
-        previous_turns = get_recent_user_turns(turns[:index])
-        repetition_signal = detect_repetition_signal(turn.get("user_text", ""), previous_turns, use_llm=False)
-        if repetition_signal["score"] > repaired_feature_scores["repetition"]:
-            repaired_feature_scores["repetition"] = repetition_signal["score"]
-
         current_score = clamp_score(int(turn.get("score", 0)))
         current_subtotal = sum(repaired_feature_scores.values())
         parsed_from_reason = parse_analysis_scores(turn.get("reason", ""))
@@ -1001,7 +1628,7 @@ def repair_session_analysis_history(session_id: str) -> None:
             repaired_feature_scores
         ))
         normalized_reason = normalize_reason_text(turn.get("reason", ""), repaired_feature_scores)
-        turn["reason"] = merge_repetition_reason(normalized_reason, repetition_signal.get("reason", ""))
+        turn["reason"] = normalized_reason
 
         if score_included:
             turn["confidence"] = calculate_confidence_from_feature_scores(repaired_feature_scores, current_score)
@@ -1277,6 +1904,15 @@ def get_analysis_fallback_text() -> str:
         "판단: 판단 어려움\n"
         "의심점수: 0\n"
         "질문반복점수: 0\n"
+        "기억혼란점수: 0\n"
+        "시간혼란점수: 0\n"
+        "문장비논리점수: 0\n"
+        f"근거: {get_default_reason()}"
+    )
+
+
+def get_feature_analysis_fallback_text() -> str:
+    return (
         "기억혼란점수: 0\n"
         "시간혼란점수: 0\n"
         "문장비논리점수: 0\n"
@@ -1602,6 +2238,361 @@ def extract_analysis_fields(response_text: str) -> dict:
     }
 
 
+def parse_feature_analysis_scores(text: str) -> dict:
+    parsed = parse_analysis_scores(text)
+    return {
+        "memory": parsed["memory"],
+        "time_confusion": parsed["time_confusion"],
+        "incoherence": parsed["incoherence"],
+    }
+
+
+def is_feature_analysis_complete(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+
+    required_patterns = [
+        r"기억혼란점수:\s*(\d+)",
+        r"시간혼란점수:\s*(\d+)",
+        r"문장비논리점수:\s*(\d+)",
+        r"근거:\s*(.+)",
+    ]
+
+    for pattern in required_patterns:
+        if not re.search(pattern, text, re.DOTALL):
+            return False
+
+    reason_match = re.search(r"근거:\s*(.+)", text, re.DOTALL)
+    reason = reason_match.group(1).strip() if reason_match else ""
+
+    if is_invalid_reason_text(reason):
+        return False
+
+    if len(split_sentences(reason)) < 2:
+        return False
+
+    return True
+
+
+def force_feature_analysis_format(raw_text: str) -> str:
+    if not raw_text or not raw_text.strip():
+        return get_feature_analysis_fallback_text()
+
+    cleaned = raw_text.strip()
+    scores = parse_feature_analysis_scores(cleaned)
+    reason_match = re.search(r"근거:\s*(.+)", cleaned, re.DOTALL)
+    reason_text = reason_match.group(1).strip() if reason_match else ""
+
+    scores_for_reason = {
+        "repetition": 0,
+        "memory": scores["memory"],
+        "time_confusion": scores["time_confusion"],
+        "incoherence": scores["incoherence"],
+    }
+    reason_text = normalize_reason_text(reason_text, scores_for_reason)
+
+    return (
+        f"기억혼란점수: {scores['memory']}\n"
+        f"시간혼란점수: {scores['time_confusion']}\n"
+        f"문장비논리점수: {scores['incoherence']}\n"
+        f"근거: {reason_text}"
+    )
+
+
+def extract_feature_analysis_fields(response_text: str) -> dict:
+    if not response_text:
+        return {
+            "reason": get_default_reason(),
+            "feature_scores": {
+                "repetition": 0,
+                "memory": 0,
+                "time_confusion": 0,
+                "incoherence": 0,
+            }
+        }
+
+    parsed = parse_feature_analysis_scores(response_text)
+    reason_match = re.search(r"근거:\s*(.+)", response_text, re.DOTALL)
+    scores_for_reason = {
+        "repetition": 0,
+        "memory": parsed["memory"],
+        "time_confusion": parsed["time_confusion"],
+        "incoherence": parsed["incoherence"],
+    }
+    reason = reason_match.group(1).strip() if reason_match else get_default_reason()
+    reason = normalize_reason_text(reason, scores_for_reason)
+
+    return {
+        "reason": reason,
+        "feature_scores": scores_for_reason,
+    }
+
+
+def get_role_analysis_fallback_text(role_key: str) -> str:
+    meta = ROLE_ANALYSIS_META[role_key]
+    return (
+        f"{meta['score_label']}: 0\n"
+        f"근거: {get_default_reason()}"
+    )
+
+
+def parse_single_role_analysis(role_key: str, response_text: str) -> dict:
+    meta = ROLE_ANALYSIS_META[role_key]
+    normalized = str(response_text or "")
+    normalized = re.sub(r"\r\n?", "\n", normalized)
+    score_match = re.search(fr"{meta['score_label']}\s*[:：]?\s*(\d+)", normalized)
+    reason_match = re.search(r"근거\s*[:：]?\s*(.+)", normalized, re.DOTALL)
+
+    score = clamp_subscore(int(score_match.group(1)) if score_match else 0, meta["max_score"])
+    reason = reason_match.group(1).strip() if reason_match else get_default_reason()
+    reason = normalize_reason_text(reason, {
+        "repetition": 0,
+        "memory": score if role_key == "memory" else 0,
+        "time_confusion": score if role_key == "time_confusion" else 0,
+        "incoherence": score if role_key == "incoherence" else 0,
+    })
+
+    return {
+        "role": role_key,
+        "score": score,
+        "reason": reason,
+    }
+
+
+def is_single_role_analysis_complete(role_key: str, text: str) -> bool:
+    if not text or not text.strip():
+        return False
+
+    meta = ROLE_ANALYSIS_META[role_key]
+    if not re.search(fr"{meta['score_label']}\s*[:：]?\s*(\d+)", text):
+        return False
+    reason_match = re.search(r"근거\s*[:：]?\s*(.+)", text, re.DOTALL)
+    reason = reason_match.group(1).strip() if reason_match else ""
+
+    if is_invalid_reason_text(reason):
+        return False
+
+    return len(split_sentences(reason)) >= 2
+
+
+def force_single_role_analysis_format(role_key: str, raw_text: str) -> str:
+    if not raw_text or not raw_text.strip():
+        return get_role_analysis_fallback_text(role_key)
+
+    parsed = parse_single_role_analysis(role_key, raw_text)
+    meta = ROLE_ANALYSIS_META[role_key]
+    return (
+        f"{meta['score_label']}: {parsed['score']}\n"
+        f"근거: {parsed['reason']}"
+    )
+
+
+def generate_single_role_analysis(
+    role_key: str,
+    question: str,
+    session_id: str | None = None,
+    conversation_context: str | None = None,
+    provider: str | None = None
+) -> dict:
+    question = normalize_text(question)
+    normalized_provider = normalize_llm_provider(provider or get_default_llm_provider())
+    if normalized_provider == "api" and not is_api_llm_configured():
+        raise RuntimeError("API 모드가 아직 설정되지 않았습니다. API 키와 모델 이름을 먼저 설정해주세요.")
+    if not validate_user_text(question):
+        return {
+            "role": role_key,
+            "score": 0,
+            "reason": get_default_reason(),
+        }
+
+    if conversation_context is None:
+        conversation_context = get_analysis_runtime_state(session_id)["analysis_context"]
+    previous_response = ""
+    primary_chain = None
+    retry_chain = None
+    if normalized_provider == "local":
+        primary_chain, retry_chain = get_or_create_role_analysis_chains(role_key)
+
+    for attempt in range(MAX_ANALYSIS_RETRY):
+        try:
+            if normalized_provider == "api":
+                prompt = ROLE_ANALYSIS_PROMPTS[role_key] if attempt == 0 else ROLE_ANALYSIS_RETRY_PROMPTS[role_key]
+                payload = {
+                    "conversation_context": conversation_context,
+                    "question": question,
+                }
+                if attempt > 0:
+                    payload["previous_response"] = previous_response
+
+                response = invoke_api_prompt(
+                    prompt,
+                    payload,
+                    model_kind="analysis",
+                    temperature=0.0,
+                    max_tokens=get_analysis_max_tokens(),
+                )
+            elif attempt == 0:
+                response = primary_chain.invoke({
+                    "conversation_context": conversation_context,
+                    "question": question,
+                })
+            else:
+                response = retry_chain.invoke({
+                    "conversation_context": conversation_context,
+                    "question": question,
+                    "previous_response": previous_response,
+                })
+
+            raw_text = response.get("text", "").strip()
+            previous_response = raw_text
+            if is_single_role_analysis_complete(role_key, raw_text):
+                return parse_single_role_analysis(role_key, force_single_role_analysis_format(role_key, raw_text))
+        except Exception as e:
+            print(f"[{role_key} 분석 재시도 {attempt + 1} 실패] {e}")
+
+    if previous_response:
+        return parse_single_role_analysis(role_key, force_single_role_analysis_format(role_key, previous_response))
+
+    if normalized_provider == "api":
+        raise RuntimeError(f"{ROLE_ANALYSIS_META[role_key]['title']} API 분석에 실패했습니다.")
+
+    return parse_single_role_analysis(role_key, get_role_analysis_fallback_text(role_key))
+
+
+def generate_repetition_role_analysis(
+    question: str,
+    session_id: str | None = None,
+    previous_turns=None,
+    provider: str | None = None
+) -> dict:
+    question = normalize_text(question)
+    normalized_provider = normalize_llm_provider(provider or get_default_llm_provider())
+    if normalized_provider == "api" and not is_api_llm_configured():
+        raise RuntimeError("API 모드가 아직 설정되지 않았습니다. API 키와 모델 이름을 먼저 설정해주세요.")
+    if previous_turns is None:
+        previous_turns = get_analysis_runtime_state(session_id)["previous_turns"]
+
+    if not validate_user_text(question) or not previous_turns:
+        return {
+            "role": "repetition",
+            "score": 0,
+            "reason": "",
+        }
+
+    try:
+        if normalized_provider == "api":
+            response = invoke_api_prompt(
+                repetition_prompt,
+                {
+                    "recent_user_questions": build_repetition_context(previous_turns),
+                    "question": question,
+                },
+                model_kind="analysis",
+                temperature=0.0,
+                max_tokens=220,
+            )
+        else:
+            repetition_chain = get_or_create_repetition_chain()
+            response = repetition_chain.invoke({
+                "recent_user_questions": build_repetition_context(previous_turns),
+                "question": question,
+            })
+        parsed = parse_repetition_chain_response(response.get("text", ""))
+        return {
+            "role": "repetition",
+            "score": clamp_subscore(int(parsed.get("score", 0)), 25),
+            "reason": normalize_text(parsed.get("reason", "")),
+        }
+    except Exception as e:
+        print(f"[repetition 분석 실패] {e}")
+        if normalized_provider == "api":
+            raise RuntimeError("질문 반복 API 분석에 실패했습니다.") from e
+        return {
+            "role": "repetition",
+            "score": 0,
+            "reason": "",
+        }
+
+
+def generate_role_analysis_result(
+    role_key: str,
+    question: str,
+    session_id: str | None = None,
+    provider: str | None = None
+) -> dict:
+    normalized_role = normalize_role_key(role_key)
+    if normalized_role == "repetition":
+        return generate_repetition_role_analysis(question, session_id=session_id, provider=provider)
+    if normalized_role in ROLE_ANALYSIS_META:
+        return generate_single_role_analysis(normalized_role, question, session_id=session_id, provider=provider)
+    raise ValueError(f"Unsupported analysis role: {role_key}")
+
+
+def build_fields_from_role_results(role_results: dict) -> dict:
+    feature_scores = {
+        "repetition": clamp_subscore(int(role_results.get("repetition", {}).get("score", 0)), 25),
+        "memory": clamp_subscore(int(role_results.get("memory", {}).get("score", 0)), 25),
+        "time_confusion": clamp_subscore(int(role_results.get("time_confusion", {}).get("score", 0)), 30),
+        "incoherence": clamp_subscore(int(role_results.get("incoherence", {}).get("score", 0)), 20),
+    }
+
+    ordered_reasons = [
+        normalize_text(role_results.get("repetition", {}).get("reason", "")),
+        normalize_text(role_results.get("memory", {}).get("reason", "")),
+        normalize_text(role_results.get("time_confusion", {}).get("reason", "")),
+        normalize_text(role_results.get("incoherence", {}).get("reason", "")),
+    ]
+
+    reason = ""
+    for item in ordered_reasons:
+        reason = merge_reason_text(reason, item)
+
+    total_score = clamp_score(sum(feature_scores.values()))
+    judgment = infer_judgment_from_score(total_score)
+
+    if not has_meaningful_feature_scores(feature_scores) and not reason:
+        judgment = "판단 어려움"
+        reason = get_default_reason()
+    elif not reason:
+        reason = build_reason_from_scores(feature_scores)
+
+    fields = {
+        "judgment": judgment,
+        "score": total_score,
+        "reason": reason,
+        "feature_scores": feature_scores,
+    }
+    fields["score_included"] = should_include_analysis_score(
+        fields["judgment"],
+        fields["score"],
+        fields["feature_scores"],
+    )
+    fields["excluded_reason"] = build_score_exclusion_reason(
+        fields["judgment"],
+        fields["score"],
+        fields["reason"],
+        fields["feature_scores"],
+    )
+    return fields
+
+
+def normalize_role_results_payload(raw_results) -> dict:
+    normalized = {}
+    source = raw_results if isinstance(raw_results, dict) else {}
+
+    for role_key in ROLE_ANALYSIS_ORDER:
+        role_payload = source.get(role_key) if isinstance(source, dict) else None
+        if not isinstance(role_payload, dict):
+            role_payload = {}
+        normalized[role_key] = {
+            "role": role_key,
+            "score": int(role_payload.get("score", 0) or 0),
+            "reason": normalize_text(role_payload.get("reason", "")),
+        }
+
+    return normalized
+
+
 def generate_analysis_with_retry(
     question: str,
     conversation_context: str = "이전 대화 없음",
@@ -1637,6 +2628,43 @@ def generate_analysis_with_retry(
         return force_analysis_format(previous_response)
 
     return get_analysis_fallback_text()
+
+
+def generate_feature_analysis_with_retry(
+    question: str,
+    conversation_context: str = "이전 대화 없음",
+    max_attempts: int = MAX_ANALYSIS_RETRY
+) -> str:
+    previous_response = ""
+    primary_chain, retry_chain = get_or_create_feature_analysis_chains()
+
+    for attempt in range(max_attempts):
+        try:
+            if attempt == 0:
+                response = primary_chain.invoke({
+                    "conversation_context": conversation_context,
+                    "question": question
+                })
+            else:
+                response = retry_chain.invoke({
+                    "conversation_context": conversation_context,
+                    "question": question,
+                    "previous_response": previous_response
+                })
+
+            raw_text = response.get("text", "").strip()
+            previous_response = raw_text
+
+            if is_feature_analysis_complete(raw_text):
+                return force_feature_analysis_format(raw_text)
+
+        except Exception as e:
+            print(f"[비반복 특징 분석 재시도 {attempt + 1} 실패] {e}")
+
+    if previous_response:
+        return force_feature_analysis_format(previous_response)
+
+    return get_feature_analysis_fallback_text()
 
 
 # =========================
@@ -1771,14 +2799,27 @@ def build_full_text(answer_text: str, fields: dict) -> str:
     )
 
 
-def generate_answer_result(question: str) -> dict:
+def generate_answer_result(question: str, provider: str | None = None) -> dict:
     question = normalize_text(question)
+    normalized_provider = normalize_llm_provider(provider or get_default_llm_provider())
 
     if not validate_user_text(question):
-        return build_short_input_result()
+        result = build_short_input_result()
+        result["llm_provider"] = normalized_provider
+        return result
 
     try:
-        answer_response = get_or_create_answer_chain().invoke({"question": question})
+        if normalized_provider == "api":
+            answer_response = invoke_api_prompt(
+                answer_prompt,
+                {"question": question},
+                model_kind="answer",
+                temperature=0.2,
+                max_tokens=256,
+            )
+        else:
+            answer_response = get_or_create_answer_chain().invoke({"question": question})
+
         answer_text = answer_response.get("text", "").strip()
         answer_text = re.sub(r"^\s*AI:\s*", "", answer_text)
 
@@ -1787,19 +2828,28 @@ def generate_answer_result(question: str) -> dict:
 
         return {
             "answer": answer_text,
-            "is_answer_only": True
+            "is_answer_only": True,
+            "llm_provider": normalized_provider,
         }
 
     except Exception as e:
-        print(f"LLM ?묐떟 ?앹꽦 ?ㅽ뙣: {e}")
-        return build_error_result()
+        print(f"LLM 응답 생성 실패: {e}")
+        error_result = build_error_result()
+        if normalized_provider == "api" and not is_api_llm_configured():
+            error_result["answer"] = "API 모드가 아직 설정되지 않았습니다. API 키와 모델 이름을 먼저 입력해주세요."
+            error_result["reason"] = "외부 API 설정이 없어 API 모드로 응답을 생성하지 못했습니다."
+            error_result["excluded_reason"] = "외부 API 설정이 완료되지 않아 이번 대화는 점수 통계에서 제외했습니다."
+        error_result["llm_provider"] = normalized_provider
+        return error_result
 
 
-def generate_analysis_result(question: str, session_id: str | None = None) -> dict:
+def generate_analysis_result(question: str, session_id: str | None = None, provider: str | None = None) -> dict:
     question = normalize_text(question)
+    normalized_provider = normalize_llm_provider(provider or get_default_llm_provider())
 
     if not validate_user_text(question):
         short_input_result = build_short_input_result()
+        short_input_result["llm_provider"] = normalized_provider
         return {
             "judgment": short_input_result["judgment"],
             "score": short_input_result["score"],
@@ -1807,34 +2857,57 @@ def generate_analysis_result(question: str, session_id: str | None = None) -> di
             "feature_scores": short_input_result["feature_scores"],
             "score_included": short_input_result["score_included"],
             "excluded_reason": short_input_result["excluded_reason"],
+            "llm_provider": normalized_provider,
         }
 
-    analysis_context = build_analysis_context(session_id)
-    analysis_text = generate_analysis_with_retry(question, conversation_context=analysis_context)
-    fields = extract_analysis_fields(analysis_text)
-    previous_turns = get_recent_user_turns(turn_store.get(session_id, []))
-    fields = apply_repetition_guardrail(question, fields, previous_turns)
-    fields["score_included"] = should_include_analysis_score(
-        fields["judgment"],
-        fields["score"],
-        fields["feature_scores"]
-    )
-    fields["excluded_reason"] = build_score_exclusion_reason(
-        fields["judgment"],
-        fields["score"],
-        fields["reason"],
-        fields["feature_scores"]
-    )
+    runtime_state = get_analysis_runtime_state(session_id)
+    role_results = {
+        "repetition": generate_repetition_role_analysis(
+            question,
+            session_id=session_id,
+            previous_turns=runtime_state["previous_turns"],
+            provider=normalized_provider,
+        ),
+        "memory": generate_single_role_analysis(
+            "memory",
+            question,
+            session_id=session_id,
+            conversation_context=runtime_state["analysis_context"],
+            provider=normalized_provider,
+        ),
+        "time_confusion": generate_single_role_analysis(
+            "time_confusion",
+            question,
+            session_id=session_id,
+            conversation_context=runtime_state["analysis_context"],
+            provider=normalized_provider,
+        ),
+        "incoherence": generate_single_role_analysis(
+            "incoherence",
+            question,
+            session_id=session_id,
+            conversation_context=runtime_state["analysis_context"],
+            provider=normalized_provider,
+        ),
+    }
+    fields = build_fields_from_role_results(role_results)
+    fields["llm_provider"] = normalized_provider
     return fields
 
 
-def get_response_from_llama(question: str, session_id: str | None = None) -> dict:
-    answer_result = generate_answer_result(question)
+def get_response_from_llama(
+    question: str,
+    session_id: str | None = None,
+    provider: str | None = None
+) -> dict:
+    normalized_provider = normalize_llm_provider(provider or get_default_llm_provider())
+    answer_result = generate_answer_result(question, provider=normalized_provider)
 
     if all(key in answer_result for key in ["full_text", "judgment", "score", "reason", "feature_scores"]):
+        answer_result["llm_provider"] = normalized_provider
         return answer_result
 
-    fields = generate_analysis_result(question, session_id=session_id)
+    fields = generate_analysis_result(question, session_id=session_id, provider=normalized_provider)
     full_text = build_full_text(answer_result["answer"], fields)
 
     return {
@@ -1846,6 +2919,7 @@ def get_response_from_llama(question: str, session_id: str | None = None) -> dic
         "feature_scores": fields["feature_scores"],
         "score_included": fields.get("score_included", True),
         "excluded_reason": fields.get("excluded_reason", ""),
+        "llm_provider": normalized_provider,
     }
 
 
@@ -1861,7 +2935,8 @@ def build_chat_response(
     follow_up_messages=None,
     turn=None,
     score_included: bool = True,
-    excluded_reason: str = ""
+    excluded_reason: str = "",
+    llm_provider: str = "local"
 ):
     recent_average_score = get_recent_average_score(session_id)
     risk_level = get_risk_level_from_score(recent_average_score)
@@ -1877,6 +2952,7 @@ def build_chat_response(
         "score": clamp_score(score),
         "reason": reason,
         "feature_scores": feature_scores,
+        "llm_provider": normalize_llm_provider(llm_provider),
         "score_included": bool(score_included),
         "excluded_reason": str(excluded_reason or ""),
         "average_score": get_average_score(session_id),
@@ -1888,6 +2964,65 @@ def build_chat_response(
         "turn": turn,
         "recall": serialize_recall_state(session_id)
     })
+
+
+def finalize_analysis_response(
+    session_id: str,
+    user_input: str,
+    answer_text: str,
+    fields: dict,
+    llm_provider: str = "local"
+):
+    recall_feedback = evaluate_recall_answer(session_id, user_input)
+    add_to_history(session_id, "user", user_input)
+    follow_up_messages = []
+
+    if recall_feedback:
+        follow_up_messages.append(recall_feedback)
+
+    recall_prompt = maybe_advance_recall_test(session_id)
+    if recall_prompt:
+        follow_up_messages.append(recall_prompt)
+
+    full_text = build_full_text(answer_text, fields)
+    history_full_text = full_text
+    if follow_up_messages:
+        history_full_text = f"{history_full_text}\n\n" + "\n\n".join(follow_up_messages)
+
+    add_to_history(session_id, "assistant", history_full_text)
+    if fields.get("score_included", True):
+        add_score_history(session_id, fields["score"])
+
+    turn = add_turn_history(
+        session_id=session_id,
+        user_text=user_input,
+        answer=answer_text,
+        judgment=fields["judgment"],
+        score=fields["score"],
+        reason=fields["reason"],
+        feature_scores=fields["feature_scores"],
+        follow_up_messages=follow_up_messages,
+        score_included=fields.get("score_included", True),
+        excluded_reason=fields.get("excluded_reason", ""),
+        llm_provider=llm_provider,
+    )
+    analysis_runtime_cache.pop(session_id, None)
+
+    return build_chat_response(
+        session_id=session_id,
+        user_speech=user_input,
+        sys_response=full_text,
+        answer=answer_text,
+        judgment=fields["judgment"],
+        score=fields["score"],
+        reason=fields["reason"],
+        feature_scores=fields["feature_scores"],
+        follow_up_messages=follow_up_messages,
+        turn=turn,
+        score_included=fields.get("score_included", True),
+        excluded_reason=fields.get("excluded_reason", ""),
+        llm_provider=llm_provider,
+    )
 
 
 def get_server_host() -> str:
@@ -1959,7 +3094,9 @@ def index():
 def health():
     model_status = get_model_status()
     credentials_status = get_google_credentials_status()
-    ready = model_status["exists"] and credentials_status["configured"]
+    provider_status = get_llm_provider_status()
+    llm_ready = provider_status["local"]["ready"] or provider_status["api"]["ready"]
+    ready = llm_ready and credentials_status["configured"]
 
     return jsonify({
         "status": "ok" if ready else "degraded",
@@ -1967,7 +3104,8 @@ def health():
         "time": datetime.now().isoformat(),
         "ready": ready,
         "model": model_status,
-        "google_credentials": credentials_status
+        "google_credentials": credentials_status,
+        "llm_provider": provider_status
     })
 
 
@@ -2008,22 +3146,91 @@ def generate_answer():
     try:
         data = request.get_json(silent=True) or {}
         user_input = normalize_text(data.get("message", ""))
+        llm_provider = get_requested_llm_provider(data)
 
         if not user_input:
-            return jsonify({"error": "遺꾩꽍???띿뒪?멸? ?놁뒿?덈떎."}), 400
+            return jsonify({"error": "분석할 텍스트가 없습니다."}), 400
 
-        result = generate_answer_result(user_input)
+        result = generate_answer_result(user_input, provider=llm_provider)
 
         return jsonify({
             "session_id": session_id,
             "user_speech": user_input,
             "answer": result.get("answer", ""),
-            "is_answer_only": True
+            "is_answer_only": True,
+            "llm_provider": llm_provider
         })
 
     except Exception as e:
-        print(f"?묐떟 ?ъ쟾 ?앹꽦 ?ㅻ쪟: {e}")
-        return jsonify({"error": "?묐떟 ?앹꽦 以?臾몄젣媛 諛쒖깮?덉뒿?덈떎."}), 500
+        print(f"응답 사전 생성 오류: {e}")
+        return jsonify({"error": "응답 생성 중 문제가 발생했습니다."}), 500
+
+
+@app.route("/analyze-role", methods=["POST"])
+def analyze_role():
+    session_id = get_or_create_session_id()
+
+    try:
+        data = request.get_json(silent=True) or {}
+        user_input = normalize_text(data.get("message", ""))
+        role_key = normalize_role_key(data.get("role", ""))
+        llm_provider = get_requested_llm_provider(data)
+
+        if not user_input:
+            return jsonify({"error": "분석할 텍스트가 없습니다."}), 400
+        if role_key not in {"repetition", "memory", "time_confusion", "incoherence"}:
+            return jsonify({"error": "지원하지 않는 분석 역할입니다."}), 400
+
+        role_result = generate_role_analysis_result(
+            role_key,
+            user_input,
+            session_id=session_id,
+            provider=llm_provider,
+        )
+
+        return jsonify({
+            "session_id": session_id,
+            "role": role_key,
+            "score": int(role_result.get("score", 0)),
+            "reason": role_result.get("reason", ""),
+            "llm_provider": llm_provider,
+        })
+
+    except Exception as e:
+        print(f"역할별 분석 오류: {e}")
+        return jsonify({"error": "역할별 분석 중 문제가 발생했습니다."}), 500
+
+
+@app.route("/finalize-analysis", methods=["POST"])
+def finalize_analysis():
+    session_id = get_or_create_session_id()
+
+    try:
+        data = request.get_json(silent=True) or {}
+        user_input = normalize_text(data.get("message", ""))
+        precomputed_answer = normalize_text(data.get("answer", ""))
+        llm_provider = get_requested_llm_provider(data)
+        role_results = normalize_role_results_payload(data.get("role_results", {}))
+
+        if not user_input:
+            return jsonify({"error": "분석할 텍스트가 없습니다."}), 400
+
+        answer_result = {"answer": precomputed_answer} if precomputed_answer else generate_answer_result(
+            user_input,
+            provider=llm_provider,
+        )
+        fields = build_fields_from_role_results(role_results)
+        return finalize_analysis_response(
+            session_id=session_id,
+            user_input=user_input,
+            answer_text=answer_result.get("answer", ""),
+            fields=fields,
+            llm_provider=llm_provider,
+        )
+
+    except Exception as e:
+        print(f"최종 분석 반영 오류: {e}")
+        return jsonify({"error": "최종 분석 반영 중 문제가 발생했습니다."}), 500
 
 
 @app.route("/analyze-text", methods=["POST"])
@@ -2034,69 +3241,22 @@ def analyze_text():
         data = request.get_json(silent=True) or {}
         user_input = normalize_text(data.get("message", ""))
         precomputed_answer = normalize_text(data.get("answer", ""))
+        llm_provider = get_requested_llm_provider(data)
 
         if not user_input:
             return jsonify({"error": "분석할 텍스트가 없습니다."}), 400
 
-        recall_feedback = evaluate_recall_answer(session_id, user_input)
-        answer_result = {"answer": precomputed_answer} if precomputed_answer else generate_answer_result(user_input)
-        fields = generate_analysis_result(user_input, session_id=session_id)
-
-        result = {
-            "answer": answer_result.get("answer", ""),
-            "judgment": fields["judgment"],
-            "score": fields["score"],
-            "reason": fields["reason"],
-            "feature_scores": fields["feature_scores"],
-            "score_included": fields.get("score_included", True),
-            "excluded_reason": fields.get("excluded_reason", ""),
-        }
-
-        add_to_history(session_id, "user", user_input)
-        follow_up_messages = []
-
-        if recall_feedback:
-            follow_up_messages.append(recall_feedback)
-
-        recall_prompt = maybe_advance_recall_test(session_id)
-        if recall_prompt:
-            follow_up_messages.append(recall_prompt)
-
-        result["full_text"] = build_full_text(result["answer"], fields)
-
-        history_full_text = result["full_text"]
-        if follow_up_messages:
-            history_full_text = f"{history_full_text}\n\n" + "\n\n".join(follow_up_messages)
-
-        add_to_history(session_id, "assistant", history_full_text)
-        if result["score_included"]:
-            add_score_history(session_id, result["score"])
-        turn = add_turn_history(
-            session_id=session_id,
-            user_text=user_input,
-            answer=result["answer"],
-            judgment=result["judgment"],
-            score=result["score"],
-            reason=result["reason"],
-            feature_scores=result["feature_scores"],
-            follow_up_messages=follow_up_messages,
-            score_included=result["score_included"],
-            excluded_reason=result["excluded_reason"],
+        answer_result = {"answer": precomputed_answer} if precomputed_answer else generate_answer_result(
+            user_input,
+            provider=llm_provider,
         )
-
-        return build_chat_response(
+        fields = generate_analysis_result(user_input, session_id=session_id, provider=llm_provider)
+        return finalize_analysis_response(
             session_id=session_id,
-            user_speech=user_input,
-            sys_response=result["full_text"],
-            answer=result["answer"],
-            judgment=result["judgment"],
-            score=result["score"],
-            reason=result["reason"],
-            feature_scores=result["feature_scores"],
-            follow_up_messages=follow_up_messages,
-            turn=turn,
-            score_included=result["score_included"],
-            excluded_reason=result["excluded_reason"],
+            user_input=user_input,
+            answer_text=answer_result.get("answer", ""),
+            fields=fields,
+            llm_provider=llm_provider,
         )
 
     except Exception as e:
@@ -2108,6 +3268,7 @@ def analyze_text():
 def chat():
     session_id = get_or_create_session_id()
     user_input = ""
+    llm_provider = get_requested_llm_provider()
 
     try:
         if "audio" in request.files:
@@ -2144,6 +3305,7 @@ def chat():
         else:
             data = request.get_json(silent=True) or {}
             user_input = normalize_text(data.get("message", ""))
+            llm_provider = get_requested_llm_provider(data)
 
             if not user_input:
                 return build_chat_response(
@@ -2165,7 +3327,7 @@ def chat():
                 )
 
         recall_feedback = evaluate_recall_answer(session_id, user_input)
-        result = get_response_from_llama(user_input, session_id=session_id)
+        result = get_response_from_llama(user_input, session_id=session_id, provider=llm_provider)
 
         if recall_feedback:
             result["answer"] = f"{result['answer']}\n\n{recall_feedback}"
@@ -2193,6 +3355,7 @@ def chat():
             follow_up_messages=follow_up_messages,
             score_included=result.get("score_included", True),
             excluded_reason=result.get("excluded_reason", ""),
+            llm_provider=llm_provider,
         )
 
         return build_chat_response(
@@ -2208,6 +3371,7 @@ def chat():
             turn=turn,
             score_included=result.get("score_included", True),
             excluded_reason=result.get("excluded_reason", ""),
+            llm_provider=llm_provider,
         )
 
     except Exception as e:
@@ -2238,6 +3402,7 @@ def reset_history():
     conversation_store[session_id] = []
     score_store[session_id] = []
     turn_store[session_id] = []
+    analysis_runtime_cache.pop(session_id, None)
     recall_store[session_id] = {
         "status": "idle",
         "target_word": "",

@@ -222,9 +222,6 @@ Recall Memory Test는 일정 턴마다 자동으로 삽입됩니다.
 
 ![시스템 동작 GIF](docs/images/demo-flow.gif)
 
-발표 자료나 시연 영상에 바로 사용할 수 있도록 MP4 파일도 함께 자동 생성됩니다.  
-[발표용 시연 영상 다운로드](docs/media/demo-flow.mp4)
-
 #### 대표 화면 구성
 
 | 메인 대시보드                                                                    | 음성 녹음 진행                                                               |
@@ -411,7 +408,6 @@ npm run capture:docs
 - `docs/images/05-final-dashboard.png`
 - `docs/images/06-recall-test.png`
 - `docs/images/demo-flow.gif`
-- `docs/media/demo-flow.mp4`
 
 ---
 

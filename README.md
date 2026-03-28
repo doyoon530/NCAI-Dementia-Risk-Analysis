@@ -4,8 +4,16 @@
 
 # 대화하며 진단하는 치매 케어 AI "Dr.지누"
 
-경상국립대학교 기업형 캡스톤디자인 프로젝트로 개발한 대화형 치매 케어 AI 시스템이다.
-사용자의 음성 발화를 텍스트로 변환한 뒤, 답변 생성과 언어 특징 분석을 분리 수행하고, 그 결과를 대시보드 형태로 시각화하여 제공한다.
+Dr.지누는 대화형 음성 인터페이스를 통해 인지 위험 신호를 분석하고 시각화하는 치매 케어 AI 시스템이다.  
+경상국립대학교 기업형 캡스톤디자인 프로젝트로 개발되었으며, 음성 입력, STT, AI 응답 생성, 역할별 언어 특징 분석, 기억 회상 테스트, 대시보드 시각화를 하나의 흐름으로 통합한다.
+
+<p align="center">
+  <a href="https://youtu.be/DrihQEexQAg">
+    <img alt="Demo Video" src="https://img.shields.io/badge/YouTube-Demo%20Video-FF0000?style=for-the-badge&logo=youtube&logoColor=white" />
+  </a>
+</p>
+
+> 시연 영상: [Dr.지누 Demo Video](https://youtu.be/DrihQEexQAg)
 
 ---
 

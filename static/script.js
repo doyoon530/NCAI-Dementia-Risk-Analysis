@@ -231,23 +231,462 @@ const analysisRoleLabels = {
   time_confusion: "시간 / 상황 혼란",
   incoherence: "문장 비논리성",
 };
-const urlParams = new URLSearchParams(window.location.search);
-const demoMode = normalizeText(urlParams.get("demo"));
-const isDemoMode = Boolean(demoMode);
-const captureMode = normalizeText(urlParams.get("capture"));
-const isDocsCapture = captureMode === "docs";
-
-if (isDocsCapture) {
-  document.body.classList.add("is-docs-capture");
-  document.body.dataset.captureMode = captureMode;
+function isStaticDocsCaptureMode() {
+  return document.body.classList.contains("is-docs-capture");
 }
+
+function isStaticVideoCaptureMode() {
+  return document.body.classList.contains("is-video-capture");
+}
+
+function isStaticCaptureMode() {
+  return isStaticDocsCaptureMode() || isStaticVideoCaptureMode();
+}
+
+function shouldAttemptLocalRuntime() {
+  const params = new URLSearchParams(window.location.search);
+  return params.has("demo") || params.has("capture");
+}
+
+let localRuntimeScriptPromise = null;
+let localRuntimeInitialized = false;
+let localRuntimeHandled = false;
+
+function loadOptionalLocalRuntimeScript() {
+  if (!shouldAttemptLocalRuntime()) {
+    return Promise.resolve(false);
+  }
+
+  if (localRuntimeScriptPromise) {
+    return localRuntimeScriptPromise;
+  }
+
+  localRuntimeScriptPromise = new Promise((resolve) => {
+    const existingScript = document.querySelector(
+      'script[data-local-runtime="true"]',
+    );
+
+    if (existingScript) {
+      resolve(Boolean(window.__ncaiLocalInit));
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = `/static/local-runtime.local.js?ts=${Date.now()}`;
+    script.async = true;
+    script.dataset.localRuntime = "true";
+    script.onload = () => resolve(Boolean(window.__ncaiLocalInit));
+    script.onerror = () => resolve(false);
+    document.head.appendChild(script);
+  });
+
+  return localRuntimeScriptPromise;
+}
+
+async function runOptionalLocalRuntime() {
+  if (!shouldAttemptLocalRuntime()) {
+    return false;
+  }
+
+  if (localRuntimeInitialized) {
+    return localRuntimeHandled;
+  }
+
+  localRuntimeInitialized = true;
+  await loadOptionalLocalRuntimeScript();
+
+  if (typeof window.__ncaiLocalInit !== "function") {
+    return false;
+  }
+
+  try {
+    localRuntimeHandled = Boolean(await window.__ncaiLocalInit());
+  } catch (error) {
+    console.warn("로컬 데모 런타임을 적용하지 못했습니다.", error);
+    localRuntimeHandled = false;
+  }
+
+  return localRuntimeHandled;
+}
+
+let sfxContext = null;
+let sfxMasterGainNode = null;
+let sfxDynamicsNode = null;
+const sfxCooldownMap = new Map();
+
+const SFX_ROLE_FREQUENCIES = {
+  repetition: 392,
+  memory: 452,
+  time_confusion: 523.25,
+  incoherence: 659.25,
+};
 
 function isMobileTabViewport() {
   return window.innerWidth <= MOBILE_TAB_BREAKPOINT;
 }
 
+async function ensureSfxContext() {
+  if (isStaticCaptureMode()) {
+    return null;
+  }
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    return null;
+  }
+
+  if (!sfxContext || sfxContext.state === "closed") {
+    sfxContext = new AudioContextClass();
+    sfxDynamicsNode = sfxContext.createDynamicsCompressor();
+    sfxDynamicsNode.threshold.value = -16;
+    sfxDynamicsNode.knee.value = 14;
+    sfxDynamicsNode.ratio.value = 2.6;
+    sfxDynamicsNode.attack.value = 0.003;
+    sfxDynamicsNode.release.value = 0.18;
+
+    sfxMasterGainNode = sfxContext.createGain();
+    sfxMasterGainNode.gain.value = 0.24;
+
+    sfxDynamicsNode.connect(sfxMasterGainNode);
+    sfxMasterGainNode.connect(sfxContext.destination);
+  }
+
+  if (sfxContext.state === "suspended") {
+    try {
+      await sfxContext.resume();
+    } catch (error) {
+      return null;
+    }
+  }
+
+  return sfxContext.state === "running" ? sfxContext : null;
+}
+
+function primeSfxContext() {
+  void ensureSfxContext();
+}
+
+function canPlaySfx(soundKey, minInterval = 90) {
+  const now = performance.now();
+  const lastPlayedAt = sfxCooldownMap.get(soundKey) || 0;
+
+  if (now - lastPlayedAt < minInterval) {
+    return false;
+  }
+
+  sfxCooldownMap.set(soundKey, now);
+  return true;
+}
+
+function scheduleSfxTone(
+  ctx,
+  startAt,
+  {
+    frequency = 440,
+    type = "sine",
+    duration = 0.12,
+    gain = 0.18,
+    attack = 0.01,
+    release = 0.12,
+    detune = 0,
+    endFrequency = null,
+    q = 0,
+    filterType = "lowpass",
+    filterFrequency = 1800,
+  } = {},
+) {
+  if (!ctx || !sfxDynamicsNode) {
+    return startAt;
+  }
+
+  const oscillator = ctx.createOscillator();
+  const toneGain = ctx.createGain();
+  const filter = ctx.createBiquadFilter();
+  const endAt = startAt + duration;
+
+  oscillator.type = type;
+  oscillator.frequency.setValueAtTime(frequency, startAt);
+  oscillator.detune.setValueAtTime(detune, startAt);
+
+  if (Number.isFinite(endFrequency)) {
+    oscillator.frequency.exponentialRampToValueAtTime(
+      Math.max(40, endFrequency),
+      endAt,
+    );
+  }
+
+  filter.type = filterType;
+  filter.frequency.setValueAtTime(filterFrequency, startAt);
+  filter.Q.setValueAtTime(q, startAt);
+
+  toneGain.gain.setValueAtTime(0.0001, startAt);
+  toneGain.gain.linearRampToValueAtTime(gain, startAt + attack);
+  toneGain.gain.exponentialRampToValueAtTime(0.0001, endAt + release);
+
+  oscillator.connect(filter);
+  filter.connect(toneGain);
+  toneGain.connect(sfxDynamicsNode);
+
+  oscillator.start(startAt);
+  oscillator.stop(endAt + release + 0.02);
+
+  return endAt + release;
+}
+
+async function playSfx(soundKey, options = {}) {
+  if (!canPlaySfx(soundKey, options.minInterval)) {
+    return;
+  }
+
+  const ctx = await ensureSfxContext();
+  if (!ctx) {
+    return;
+  }
+
+  const startAt = ctx.currentTime + 0.01;
+  const score = Number(options.score ?? 0);
+  const isElevatedRisk =
+    score >= 60 ||
+    normalizeText(options.riskLevel || "").includes("위험") ||
+    normalizeText(options.riskLevel || "").includes("주의");
+
+  switch (soundKey) {
+    case "record-start":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 392,
+        endFrequency: 430,
+        type: "triangle",
+        duration: 0.1,
+        gain: 0.11,
+        filterFrequency: 1500,
+      });
+      scheduleSfxTone(ctx, startAt + 0.085, {
+        frequency: 523.25,
+        endFrequency: 587.33,
+        type: "sine",
+        duration: 0.13,
+        gain: 0.13,
+        filterFrequency: 2200,
+      });
+      break;
+    case "record-stop":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 622.25,
+        endFrequency: 415.3,
+        type: "triangle",
+        duration: 0.18,
+        gain: 0.1,
+        filterFrequency: 1400,
+      });
+      break;
+    case "answer-ready":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 523.25,
+        type: "sine",
+        duration: 0.11,
+        gain: 0.08,
+        filterFrequency: 2000,
+      });
+      scheduleSfxTone(ctx, startAt + 0.08, {
+        frequency: 659.25,
+        type: "sine",
+        duration: 0.11,
+        gain: 0.1,
+        filterFrequency: 2200,
+      });
+      scheduleSfxTone(ctx, startAt + 0.16, {
+        frequency: 783.99,
+        type: "triangle",
+        duration: 0.16,
+        gain: 0.12,
+        filterFrequency: 2500,
+      });
+      break;
+    case "analysis-role": {
+      const roleFrequency =
+        SFX_ROLE_FREQUENCIES[options.role] || SFX_ROLE_FREQUENCIES.memory;
+      scheduleSfxTone(ctx, startAt, {
+        frequency: roleFrequency,
+        endFrequency: roleFrequency * 1.06,
+        type: "triangle",
+        duration: 0.14,
+        gain: 0.09,
+        filterFrequency: 1900,
+      });
+      scheduleSfxTone(ctx, startAt + 0.08, {
+        frequency: roleFrequency * 1.34,
+        type: "sine",
+        duration: 0.12,
+        gain: 0.05,
+        filterFrequency: 2400,
+      });
+      break;
+    }
+    case "analysis-complete":
+      if (isElevatedRisk) {
+        scheduleSfxTone(ctx, startAt, {
+          frequency: 329.63,
+          type: "triangle",
+          duration: 0.16,
+          gain: 0.08,
+          filterFrequency: 1500,
+        });
+        scheduleSfxTone(ctx, startAt + 0.16, {
+          frequency: 440,
+          type: "triangle",
+          duration: 0.18,
+          gain: 0.08,
+          filterFrequency: 1500,
+        });
+        scheduleSfxTone(ctx, startAt + 0.31, {
+          frequency: 659.25,
+          type: "sine",
+          duration: 0.26,
+          gain: 0.11,
+          filterFrequency: 1800,
+        });
+      } else {
+        scheduleSfxTone(ctx, startAt, {
+          frequency: 392,
+          type: "triangle",
+          duration: 0.16,
+          gain: 0.08,
+          filterFrequency: 1700,
+        });
+        scheduleSfxTone(ctx, startAt + 0.12, {
+          frequency: 523.25,
+          type: "sine",
+          duration: 0.18,
+          gain: 0.09,
+          filterFrequency: 2000,
+        });
+        scheduleSfxTone(ctx, startAt + 0.24, {
+          frequency: 659.25,
+          type: "triangle",
+          duration: 0.28,
+          gain: 0.12,
+          filterFrequency: 2400,
+        });
+      }
+      break;
+    case "warning-popup":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 392,
+        endFrequency: 349.23,
+        type: "triangle",
+        duration: 0.18,
+        gain: 0.11,
+        filterFrequency: 1500,
+      });
+      scheduleSfxTone(ctx, startAt + 0.22, {
+        frequency: 392,
+        endFrequency: 329.63,
+        type: "triangle",
+        duration: 0.22,
+        gain: 0.12,
+        filterFrequency: 1400,
+      });
+      break;
+    case "report-open":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 392,
+        type: "sine",
+        duration: 0.12,
+        gain: 0.07,
+        filterFrequency: 2000,
+      });
+      scheduleSfxTone(ctx, startAt + 0.07, {
+        frequency: 587.33,
+        type: "triangle",
+        duration: 0.18,
+        gain: 0.08,
+        filterFrequency: 2400,
+      });
+      break;
+    case "report-close":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 587.33,
+        endFrequency: 392,
+        type: "sine",
+        duration: 0.14,
+        gain: 0.06,
+        filterFrequency: 1800,
+      });
+      break;
+    case "reset-history":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 523.25,
+        type: "triangle",
+        duration: 0.12,
+        gain: 0.07,
+        filterFrequency: 1500,
+      });
+      scheduleSfxTone(ctx, startAt + 0.11, {
+        frequency: 392,
+        type: "triangle",
+        duration: 0.12,
+        gain: 0.07,
+        filterFrequency: 1400,
+      });
+      scheduleSfxTone(ctx, startAt + 0.22, {
+        frequency: 293.66,
+        endFrequency: 220,
+        type: "sine",
+        duration: 0.2,
+        gain: 0.08,
+        filterFrequency: 1200,
+      });
+      break;
+    case "mode-switch":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: options.mode === "api" ? 659.25 : 523.25,
+        type: "triangle",
+        duration: 0.12,
+        gain: 0.07,
+        filterFrequency: 1800,
+      });
+      break;
+    case "turn-select":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 466.16,
+        type: "sine",
+        duration: 0.1,
+        gain: 0.055,
+        filterFrequency: 2000,
+      });
+      break;
+    case "error":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 233.08,
+        endFrequency: 196,
+        type: "triangle",
+        duration: 0.16,
+        gain: 0.08,
+        filterFrequency: 1100,
+      });
+      scheduleSfxTone(ctx, startAt + 0.17, {
+        frequency: 220,
+        endFrequency: 174.61,
+        type: "triangle",
+        duration: 0.2,
+        gain: 0.09,
+        filterFrequency: 1050,
+      });
+      break;
+    default:
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 440,
+        type: "sine",
+        duration: 0.1,
+        gain: 0.05,
+        filterFrequency: 1800,
+      });
+      break;
+  }
+}
+
 function applyMobileTabState() {
-  const isEnabled = isMobileTabViewport() && !isDocsCapture;
+  const isEnabled = isMobileTabViewport() && !isStaticDocsCaptureMode();
   document.body.classList.toggle("is-mobile-tabbed", isEnabled);
 
   if (!isEnabled) {
@@ -277,7 +716,7 @@ function applyMobileTabState() {
 
 function setMobileMenuOpen(nextOpen) {
   const shouldOpen =
-    Boolean(nextOpen) && isMobileTabViewport() && !isDocsCapture;
+    Boolean(nextOpen) && isMobileTabViewport() && !isStaticDocsCaptureMode();
   isMobileMenuOpen = shouldOpen;
 
   document.body.classList.toggle("is-mobile-menu-open", shouldOpen);
@@ -463,7 +902,6 @@ function focusSelectedTurnFeedback(turnId) {
   if (!turnId) {
     return;
   }
-
   const timelineItem = turnTimelineListEl?.querySelector(
     `.analysis-timeline-item[data-turn-id="${CSS.escape(turnId)}"]`,
   );
@@ -512,509 +950,6 @@ function setMobileProcessBadge(text, tone = "idle") {
   mobileProcessBadgeEl.classList.add(`is-${tone}`);
 }
 
-function createDemoScoreHistory(scores = [], labels = []) {
-  return scores.map((score, index) => ({
-    score,
-    time: labels[index] || `10:${String(index * 3 + 10).padStart(2, "0")}:00`,
-  }));
-}
-
-function runWithViewTransition(callback) {
-  const prefersReducedMotion = window.matchMedia(
-    "(prefers-reduced-motion: reduce)",
-  ).matches;
-
-  if (
-    prefersReducedMotion ||
-    typeof document.startViewTransition !== "function"
-  ) {
-    callback();
-    return;
-  }
-
-  try {
-    document.startViewTransition(() => {
-      callback();
-    });
-  } catch (error) {
-    console.warn("View Transition 적용 실패:", error);
-    callback();
-  }
-}
-
-function buildDemoTurn(overrides = {}) {
-  const featureScores = {
-    repetition: 0,
-    memory: 0,
-    time_confusion: 0,
-    incoherence: 0,
-    ...(overrides.feature_scores || {}),
-  };
-  const scoreIncluded = overrides.score_included !== false;
-  const score = scoreIncluded
-    ? Number(
-        overrides.score ??
-          featureScores.repetition +
-            featureScores.memory +
-            featureScores.time_confusion +
-            featureScores.incoherence,
-      )
-    : 0;
-
-  return {
-    turn_id:
-      overrides.turn_id ||
-      `demo-turn-${Math.random().toString(36).slice(2, 8)}-${Date.now()}`,
-    time: overrides.time || "10:12:00",
-    user_text: overrides.user_text || "",
-    answer: overrides.answer || "",
-    judgment:
-      overrides.judgment ||
-      (scoreIncluded ? (score < 20 ? "정상" : "의심") : "판단 어려움"),
-    score,
-    reason: overrides.reason || "데모 화면을 위한 예시 분석 근거입니다.",
-    feature_scores: featureScores,
-    follow_up_messages: [...(overrides.follow_up_messages || [])],
-    score_included: scoreIncluded,
-    excluded_reason: overrides.excluded_reason || "",
-    llm_provider: overrides.llm_provider || "local",
-    risk_level: scoreIncluded
-      ? overrides.risk_level || getRiskLevelFromScore(score)
-      : "반영 제외",
-    trend: overrides.trend || "안정",
-    confidence: scoreIncluded
-      ? (overrides.confidence ?? calculateConfidenceValue(featureScores, score))
-      : 0,
-    average_score: Number(overrides.average_score ?? score),
-    recent_average_score: Number(overrides.recent_average_score ?? score),
-  };
-}
-
-function buildDemoPendingTurn(overrides = {}) {
-  return {
-    client_turn_id:
-      overrides.client_turn_id ||
-      `demo-pending-${Math.random().toString(36).slice(2, 8)}`,
-    user_text: overrides.user_text || "",
-    answer: overrides.answer || "",
-    created_at: Number(overrides.created_at || Date.now()),
-    pending_status: overrides.pending_status || "queued",
-    pending_error_message: overrides.pending_error_message || "",
-    follow_up_messages: [...(overrides.follow_up_messages || [])],
-    is_pending: true,
-  };
-}
-
-function buildDemoAnalysisData(turn, summary, recall = {}) {
-  return {
-    judgment: turn.judgment,
-    score: turn.score,
-    reason: turn.reason,
-    feature_scores: turn.feature_scores,
-    score_included: turn.score_included,
-    excluded_reason: turn.excluded_reason || "",
-    risk_level: turn.risk_level,
-    trend: turn.trend,
-    average_score: summary.average_score,
-    recent_average_score: summary.recent_average_score,
-    score_history: scoreHistory,
-    recall,
-  };
-}
-
-function getDemoScenarioMap() {
-  const historyLabels = ["10:10:12", "10:13:44", "10:16:05", "10:19:28"];
-  const sharedScoreHistory = createDemoScoreHistory(
-    [18, 28, 37, 46],
-    historyLabels,
-  );
-
-  const overviewSummary = {
-    average_score: 0,
-    recent_average_score: 0,
-    trend: "데이터 부족",
-  };
-  const monitoringSummary = {
-    average_score: 32.3,
-    recent_average_score: 36.3,
-    trend: "상승",
-  };
-
-  const baselineTurn = buildDemoTurn({
-    turn_id: "demo-turn-baseline",
-    time: "10:13:44",
-    user_text: "오늘 회의가 몇 시에 있는지 기억이 안 나.",
-    answer:
-      "회의 시간을 바로 떠올리기 어렵다면 일정표나 메일을 확인해 보시는 것이 좋겠습니다.",
-    judgment: "의심",
-    score: 28,
-    reason:
-      "시간 관련 정보를 바로 회상하지 못하는 표현이 나타났습니다. 최근 일정과 관련된 기억 인출이 다소 불안정한 모습으로 해석됩니다.",
-    feature_scores: {
-      repetition: 0,
-      memory: 12,
-      time_confusion: 12,
-      incoherence: 4,
-    },
-    risk_level: "낮은 위험",
-    trend: "안정",
-    average_score: 23.0,
-    recent_average_score: 23.0,
-  });
-
-  const finalTurn = buildDemoTurn({
-    turn_id: "demo-turn-final",
-    time: "10:19:28",
-    user_text:
-      "오늘 회의가 언제였는지 기억이 안 나. 아까 물어봤던 것 같은데 다시 알려줄 수 있어?",
-    answer:
-      "회의 시간이 바로 떠오르지 않는다면 일정 앱이나 메일 기록을 확인해 보는 것이 좋겠습니다.",
-    judgment: "의심",
-    score: 46,
-    reason:
-      "동일한 회의 시간 정보를 다시 확인하려는 반복 질문이 관찰됩니다. 기억 회상 어려움과 시간 관련 혼동 표현이 함께 나타나 인지 위험 신호가 강화된 것으로 해석됩니다.",
-    feature_scores: {
-      repetition: 15,
-      memory: 14,
-      time_confusion: 12,
-      incoherence: 5,
-    },
-    risk_level: "주의",
-    trend: "상승",
-    average_score: monitoringSummary.average_score,
-    recent_average_score: monitoringSummary.recent_average_score,
-  });
-
-  const overviewPending = buildDemoPendingTurn({
-    client_turn_id: "demo-answer-turn",
-    created_at: Date.now() - 2000,
-    user_text: "오늘 수업이 몇 시였는지 기억이 안 나.",
-    answer:
-      "수업 시간을 바로 떠올리기 어렵다면 시간표나 알림을 확인해 보시는 것이 좋겠습니다.",
-    pending_status: "queued",
-  });
-
-  const progressPending = buildDemoPendingTurn({
-    client_turn_id: "demo-analysis-turn",
-    created_at: Date.now() - 2000,
-    user_text: "오늘 회의가 몇 시였지? 조금 전에 들은 것 같은데 다시 말해줄래?",
-    answer:
-      "회의 시간을 바로 떠올리기 어렵다면 메일이나 일정표를 다시 확인해 보시는 것이 좋겠습니다.",
-    pending_status: "analyzing",
-  });
-
-  return {
-    overview: {
-      name: "overview",
-      llmMode: "local",
-      summary: overviewSummary,
-      scoreHistory: [],
-      turnHistory: [],
-      pendingTurns: [],
-      recall: { status: "idle", last_result: "없음", prompt: "" },
-      process: {
-        step: null,
-        detail: "대기 중입니다. 녹음을 시작하면 음성 입력을 기다립니다.",
-      },
-      systemState: "준비 완료",
-      thinkingText: "아직 분석 전입니다.",
-      analysisState: "reset",
-      voiceLevel: 0.06,
-    },
-    recording: {
-      name: "recording",
-      llmMode: "local",
-      summary: overviewSummary,
-      scoreHistory: [],
-      turnHistory: [],
-      pendingTurns: [],
-      recall: { status: "idle", last_result: "없음", prompt: "" },
-      process: {
-        step: "capture",
-        detail:
-          "마이크가 연결되었고 사용자의 음성을 실시간으로 수집하고 있습니다.",
-      },
-      systemState: "음성 입력 수집 중",
-      thinkingText: "음성 입력을 기다리고 있습니다.",
-      analysisState: "reset",
-      recording: true,
-      voiceLevel: 0.58,
-    },
-    answer: {
-      name: "answer",
-      llmMode: "local",
-      summary: monitoringSummary,
-      scoreHistory: sharedScoreHistory.slice(0, 3),
-      turnHistory: [baselineTurn],
-      pendingTurns: [overviewPending],
-      recall: { status: "idle", last_result: "없음", prompt: "" },
-      process: {
-        step: "answer",
-        detail:
-          "답변이 먼저 표시되었고, 역할별 위험도 분석을 준비하고 있습니다.",
-      },
-      systemState: "답변 생성 완료",
-      thinkingText: "역할별 언어 특징 분석을 곧 시작합니다.",
-      analysisState: "loading",
-      voiceLevel: 0.06,
-    },
-    "analysis-progress": {
-      name: "analysis-progress",
-      llmMode: "local",
-      summary: monitoringSummary,
-      scoreHistory: sharedScoreHistory.slice(0, 3),
-      turnHistory: [baselineTurn],
-      pendingTurns: [progressPending],
-      recall: { status: "idle", last_result: "없음", prompt: "" },
-      process: {
-        step: "analysis",
-        detail:
-          "질문 반복과 기억 혼란 항목을 반영했고, 나머지 역할 점수를 계속 분석하고 있습니다.",
-      },
-      systemState: "기억 혼란 분석 중",
-      thinkingText:
-        "역할별 결과를 모으는 동안 그래프와 점수 카드가 순차적으로 갱신되고 있습니다.",
-      analysisState: "preview",
-      analysisPreview: {
-        roleResults: {
-          repetition: {
-            score: 15,
-            reason: "이전 질문과 유사한 회의 시간 질문이 다시 등장했습니다.",
-          },
-          memory: {
-            score: 12,
-            reason: "기억이 나지 않는다는 표현이 반복적으로 나타났습니다.",
-          },
-        },
-        currentRole: "memory",
-        completedCount: 2,
-        totalCount: 4,
-      },
-      analysisThinking: true,
-      voiceLevel: 0.06,
-    },
-    final: {
-      name: "final",
-      llmMode: "local",
-      summary: monitoringSummary,
-      scoreHistory: sharedScoreHistory,
-      turnHistory: [baselineTurn, finalTurn],
-      pendingTurns: [],
-      recall: {
-        status: "memorize",
-        last_result: "없음",
-        prompt:
-          "Recall Test: 지금 제시하는 기억 단어는 '사과'입니다. 다음 대화에서 이 단어를 기억해 보세요.",
-      },
-      process: {
-        step: "render",
-        detail:
-          "답변과 분석 카드, 추세 차트, 턴 기록까지 모두 최신 결과로 갱신했습니다.",
-      },
-      systemState: "분석 완료",
-      thinkingText: "가장 최근 대화 기준의 분석 결과를 확인하고 있습니다.",
-      analysisState: "final",
-      analysisTurn: finalTurn,
-      voiceLevel: 0.06,
-    },
-    recall: {
-      name: "recall",
-      llmMode: "local",
-      summary: monitoringSummary,
-      scoreHistory: sharedScoreHistory,
-      turnHistory: [
-        baselineTurn,
-        finalTurn,
-        buildDemoTurn({
-          turn_id: "demo-turn-recall",
-          time: "10:22:04",
-          user_text: "아까 제시한 기억 단어가 뭐였지?",
-          answer:
-            "Recall Test 질문에 답하는 단계입니다. 조금 전에 제시한 기억 단어를 떠올려 보세요.",
-          judgment: "의심",
-          score: 31,
-          reason:
-            "직전 제시 정보와 관련된 회상 질문이 진행 중인 상태를 보여주는 데모 장면입니다.",
-          feature_scores: {
-            repetition: 8,
-            memory: 10,
-            time_confusion: 8,
-            incoherence: 5,
-          },
-          risk_level: "낮은 위험",
-          trend: "상승",
-          average_score: monitoringSummary.average_score,
-          recent_average_score: monitoringSummary.recent_average_score,
-        }),
-      ],
-      pendingTurns: [],
-      recall: {
-        status: "ask",
-        last_result: "없음",
-        prompt: "Recall Test: 제가 조금 전에 제시한 기억 단어가 무엇이었나요?",
-      },
-      process: {
-        step: "render",
-        detail: "분석 결과와 함께 기억 회상 테스트 단계가 표시되고 있습니다.",
-      },
-      systemState: "기억 회상 테스트 진행 중",
-      thinkingText: "기억 단어 회상 여부를 확인하는 단계입니다.",
-      analysisState: "final",
-      analysisTurn: finalTurn,
-      voiceLevel: 0.06,
-    },
-  };
-}
-
-function initializeDemoView() {
-  if (!isDemoMode) {
-    return false;
-  }
-
-  document.body.classList.add("is-demo-mode");
-  if (chatContainer) {
-    chatContainer.classList.add("is-demo-mode");
-  }
-
-  pendingTurns = [];
-  analysisTaskQueue = [];
-  isAnalysisWorkerRunning = false;
-  setAnalysisGeneration(0);
-  setRecordButtonBusyState(false);
-  hideWarningPopup();
-  applyDemoScenario(demoMode);
-  return true;
-}
-
-function applyDemoScenario(name = demoMode) {
-  const scenarios = getDemoScenarioMap();
-  const scenario = scenarios[name] || scenarios.overview;
-  const summary = scenario.summary || {
-    average_score: 0,
-    recent_average_score: 0,
-    trend: "데이터 부족",
-  };
-
-  document.body.dataset.demoReady = "false";
-  document.body.dataset.demoScenario = scenario.name;
-
-  llmMode = normalizeLlmMode(scenario.llmMode || "local");
-  localStorage.setItem("llm_mode", llmMode);
-  renderLlmModeState();
-
-  scoreHistory = Array.isArray(scenario.scoreHistory)
-    ? scenario.scoreHistory.map((item) => ({ ...item }))
-    : [];
-  turnHistory = Array.isArray(scenario.turnHistory)
-    ? scenario.turnHistory.map((turn) => ({
-        ...turn,
-        feature_scores: { ...(turn.feature_scores || {}) },
-        follow_up_messages: [...(turn.follow_up_messages || [])],
-      }))
-    : [];
-  pendingTurns = Array.isArray(scenario.pendingTurns)
-    ? scenario.pendingTurns.map((turn) => ({
-        ...turn,
-        follow_up_messages: [...(turn.follow_up_messages || [])],
-        is_pending: true,
-      }))
-    : [];
-  selectedTurnId = null;
-
-  setAnalysisLoadingState(false);
-  setAnalysisThinking(false);
-  setRecordingState(false);
-  stopVoiceAmbient();
-  setVoiceLevel(Number(scenario.voiceLevel ?? 0.06));
-
-  renderAll({
-    average_score: summary.average_score,
-    recent_average_score: summary.recent_average_score,
-    trend: summary.trend,
-  });
-  updateRecallCard(
-    scenario.recall || { status: "idle", last_result: "없음", prompt: "" },
-  );
-
-  if (turnHistory.length > 0 || pendingTurns.length > 0) {
-    renderConversationHistory({
-      preferLatestTurn: true,
-      preserveAnalysisCard: true,
-    });
-  } else {
-    renderChatEmptyState();
-    resetAnalysisCard();
-  }
-
-  if (scenario.analysisState === "loading") {
-    if (analysisJudgmentEl) analysisJudgmentEl.innerText = "분석 중";
-    if (analysisRiskLevelEl) analysisRiskLevelEl.innerText = "대기";
-    if (analysisTrendEl) analysisTrendEl.innerText = "진행 중";
-    if (analysisReasonEl) {
-      analysisReasonEl.innerText =
-        "답변은 먼저 생성되었고, 역할별 위험도 분석을 순차적으로 시작하고 있습니다.";
-    }
-    setAnalysisScoreDisplay("-", false);
-    updateFeatureBreakdown({});
-    updateConfidence({}, 0, false);
-    setAnalysisStateBadge(
-      "분석 대기",
-      "idle",
-      "답변 표시 후 역할별 분석이 시작되는 장면입니다.",
-    );
-    setAnalysisLoadingState(true);
-  } else if (scenario.analysisState === "preview" && scenario.analysisPreview) {
-    applyProgressiveAnalysisPreview(
-      scenario.analysisPreview.roleResults,
-      scenario.analysisPreview.currentRole,
-      scenario.analysisPreview.completedCount,
-      scenario.analysisPreview.totalCount,
-    );
-    applyProgressiveSummaryPreview(scenario.analysisPreview.roleResults);
-  } else if (scenario.analysisState === "final" && scenario.analysisTurn) {
-    applyTurnAnalysis(scenario.analysisTurn);
-  } else {
-    resetAnalysisCard();
-    updateFeatureBreakdown({});
-    updateConfidence({}, 0, false);
-  }
-
-  if (scenario.recording) {
-    setRecordingState(true);
-  }
-
-  if (scenario.analysisThinking) {
-    setAnalysisThinking(true);
-  }
-
-  if (scenario.process?.step) {
-    setProcessState(scenario.process.step, scenario.process.detail || "");
-  } else {
-    resetProcessState(
-      scenario.process?.detail ||
-        "대기 중입니다. 녹음을 시작하면 음성 입력을 기다립니다.",
-    );
-  }
-
-  setSystemState(scenario.systemState || "데모 화면");
-  setThinkingMessage(scenario.thinkingText || "문서 촬영용 데모 상태입니다.");
-
-  window.setTimeout(() => {
-    document.body.dataset.demoReady = "true";
-    window.dispatchEvent(
-      new CustomEvent("ncai:demo-ready", { detail: { name: scenario.name } }),
-    );
-  }, 80);
-
-  return scenario;
-}
-
-window.__ncaiDemo = {
-  isDemoMode,
-  applyScenario: applyDemoScenario,
-  scenarioNames: Object.keys(getDemoScenarioMap()),
-};
-
 function setVoiceLevel(level = 0.06) {
   const normalizedLevel = Math.max(0.06, Math.min(1, Number(level) || 0.06));
   document.documentElement.style.setProperty(
@@ -1060,6 +995,7 @@ function setVoiceLevel(level = 0.06) {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  await loadOptionalLocalRuntimeScript();
   setVoiceLevel(0.06);
   normalizeCollapsibleLayout();
   injectThreeDIcons();
@@ -1072,7 +1008,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   refreshSessionReportSurface();
   updateRecordToggleButton();
   resetProcessState("대기 중입니다. 녹음을 시작하면 음성 입력을 기다립니다.");
-  if (initializeDemoView()) {
+  if (await runOptionalLocalRuntime()) {
     return;
   }
   await loadLlmProviderStatus();
@@ -1111,6 +1047,8 @@ function bindEvents() {
     };
   }
   window.addEventListener("keydown", handleGlobalKeydown);
+  window.addEventListener("pointerdown", primeSfxContext, true);
+  window.addEventListener("keydown", primeSfxContext, true);
   window.addEventListener("resize", () => {
     repositionActiveHelpPopovers();
     applyMobileTabState();
@@ -2221,6 +2159,7 @@ function openSessionReport() {
     sessionReportModal.classList.remove("hidden");
     document.body.style.overflow = "hidden";
   });
+  void playSfx("report-open", { minInterval: 180 });
 }
 
 function closeSessionReport() {
@@ -2232,6 +2171,7 @@ function closeSessionReport() {
     sessionReportModal.classList.add("hidden");
     document.body.style.overflow = "";
   });
+  void playSfx("report-close", { minInterval: 180 });
 }
 
 function buildPrintableSessionReportHtml(report) {
@@ -2399,6 +2339,11 @@ function triggerAnalysisCompletionAnimation(data) {
   analysisSummaryToast.classList.remove("hidden", "is-visible");
   void analysisSummaryToast.offsetWidth;
   analysisSummaryToast.classList.add("is-visible");
+  void playSfx("analysis-complete", {
+    score: Number(data?.score ?? 0),
+    riskLevel: data?.risk_level || "",
+    minInterval: 420,
+  });
 
   if (summaryToastScoreEl && scoreIncluded) {
     animateNumber(summaryToastScoreEl, 0, score, 750, false);
@@ -2642,6 +2587,11 @@ async function runAnalysisTask(task) {
         reason: normalizeText(roleData?.reason || ""),
       };
 
+      void playSfx("analysis-role", {
+        role,
+        score: Number(roleResults[role].score ?? 0),
+        minInterval: 180,
+      });
       applyProgressiveAnalysisPreview(roleResults, role, index + 1, totalRoles);
       applyProgressiveSummaryPreview(roleResults);
     }
@@ -2690,6 +2640,7 @@ async function runAnalysisTask(task) {
     setThinkingMessage("가장 최근 대화 기준의 분석 결과를 확인하고 있습니다.");
   } catch (error) {
     console.error(error);
+    void playSfx("error", { minInterval: 220 });
     updatePendingTurn(task.clientTurnId, {
       pending_status: "failed",
       pending_error_message:
@@ -2761,6 +2712,8 @@ function toggleRecording() {
   if (isAnswerPending) {
     return;
   }
+
+  primeSfxContext();
 
   if (mediaRecorder && mediaRecorder.state !== "inactive") {
     stopRecording();
@@ -2945,6 +2898,10 @@ function setLlmMode(mode, options = {}) {
 
   if (!silent) {
     setSystemState(llmMode === "api" ? "외부 API 모드 선택" : "로컬 모드 선택");
+    void playSfx("mode-switch", {
+      mode: llmMode,
+      minInterval: 160,
+    });
   }
 
   refreshSessionReportSurface();
@@ -3118,6 +3075,7 @@ function stopRecording() {
     return;
   }
 
+  void playSfx("record-stop", { minInterval: 150 });
   mediaRecorder.stop();
   setRecordingState(false);
   cleanupRecordingStream();
@@ -3204,8 +3162,12 @@ async function resetHistory() {
         ? "이전 요청은 모두 반영하지 않도록 정리했고, 새 대화부터 다시 분석합니다."
         : "기록을 비웠습니다. 새 녹음을 시작하면 다시 분석을 진행합니다.",
     );
+    void playSfx("reset-history", {
+      minInterval: 260,
+    });
   } catch (error) {
     console.error(error);
+    void playSfx("error", { minInterval: 220 });
     alert("기록 초기화 중 오류가 발생했습니다.");
   }
 }
@@ -3787,6 +3749,7 @@ function selectTurnById(turnId, options = {}) {
     renderTurnTimelineSurface();
     focusSelectedTurnFeedback(turnId);
   });
+  void playSfx("turn-select", { minInterval: 80 });
 }
 
 function updateFeatureBreakdown(featureScores) {
@@ -4286,6 +4249,7 @@ async function handleRecognizedTextFlow(
     setProcessError(
       "답변 생성 단계에서 문제가 발생해 다음 분석 단계로 넘어가지 못했습니다.",
     );
+    void playSfx("error", { minInterval: 220 });
     syncBackgroundAnalysisState();
     return;
   }
@@ -4305,6 +4269,7 @@ async function handleRecognizedTextFlow(
   });
   renderConversationHistory({ preserveAnalysisCard: true });
   setRecordButtonBusyState(false);
+  void playSfx("answer-ready", { minInterval: 240 });
 
   setAnalysisStateBadge(
     "분석 대기",
@@ -4410,6 +4375,7 @@ async function startRecording() {
           setProcessError(
             "음성 인식 단계에서 문제가 발생해 발화 문장을 추출하지 못했습니다.",
           );
+          void playSfx("error", { minInterval: 220 });
           syncBackgroundAnalysisState();
           return;
         }
@@ -4426,6 +4392,7 @@ async function startRecording() {
           setProcessError(
             "인식된 문장이 없어 답변 생성과 위험도 분석을 진행할 수 없습니다.",
           );
+          void playSfx("error", { minInterval: 220 });
           syncBackgroundAnalysisState();
           return;
         }
@@ -4447,6 +4414,7 @@ async function startRecording() {
         setProcessError(
           "음성 전송부터 분석 반영까지 이어지는 처리 과정에서 예외가 발생했습니다.",
         );
+        void playSfx("error", { minInterval: 220 });
         syncBackgroundAnalysisState();
       } finally {
         stopCaptureNarration();
@@ -4458,6 +4426,7 @@ async function startRecording() {
     };
 
     mediaRecorder.start();
+    void playSfx("record-start", { minInterval: 150 });
     setRecordingState(true);
     resetProcessState("녹음을 시작했고, 사용자 발화를 기다리고 있습니다.");
     setProcessState(
@@ -4471,6 +4440,7 @@ async function startRecording() {
     stopVoiceAmbient();
     setRecordButtonBusyState(false);
     setRecordingState(false);
+    void playSfx("error", { minInterval: 220 });
     alert("마이크 접근 권한을 확인한 뒤 다시 시도해 주세요.");
   }
 }
@@ -4869,6 +4839,7 @@ function showWarningPopup(message) {
 
   warningPopupText.innerText = message;
   warningPopup.classList.remove("hidden");
+  void playSfx("warning-popup", { minInterval: 900 });
 }
 
 function hideWarningPopup() {

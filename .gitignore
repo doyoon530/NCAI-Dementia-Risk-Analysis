@@ -194,3 +194,11 @@ stt-bot-*.json
 
 # Runtime uploads
 uploads/
+
+# Local-only demo / capture assets
+static/local-runtime.local.js
+scripts/*.local.mjs
+docs/media/
+docs/images/demo-flow.gif
+docs/images/card-status-risk.gif
+docs/ppt-work/

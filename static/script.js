@@ -325,6 +325,29 @@ function isMobileTabViewport() {
   return window.innerWidth <= MOBILE_TAB_BREAKPOINT;
 }
 
+function runWithViewTransition(callback) {
+  const prefersReducedMotion = window.matchMedia(
+    "(prefers-reduced-motion: reduce)",
+  ).matches;
+
+  if (
+    prefersReducedMotion ||
+    typeof document.startViewTransition !== "function"
+  ) {
+    callback();
+    return;
+  }
+
+  try {
+    document.startViewTransition(() => {
+      callback();
+    });
+  } catch (error) {
+    console.warn("화면 전환 애니메이션을 적용하지 못했습니다.", error);
+    callback();
+  }
+}
+
 async function ensureSfxContext() {
   if (isStaticCaptureMode()) {
     return null;

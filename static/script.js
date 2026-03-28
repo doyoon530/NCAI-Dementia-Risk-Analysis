@@ -30,6 +30,8 @@ let analysisSummaryToastTimer = null;
 let lastRenderedSessionReport = null;
 const helpPopoverRegistry = [];
 let scoreCascadeTimers = [];
+const roleChipAnimationTimers = new Map();
+let linePointPulseFrame = null;
 let lastMetricSnapshot = {
   averageScore: 0,
   recentAverageScore: 0,
@@ -456,6 +458,190 @@ function scheduleSfxTone(
   return endAt + release;
 }
 
+function scheduleSfxChord(ctx, startAt, frequencies = [], options = {}) {
+  const {
+    type = "sine",
+    duration = 0.16,
+    gain = 0.06,
+    stagger = 0,
+    filterFrequency = 2000,
+    release = 0.14,
+  } = options;
+
+  frequencies.forEach((frequency, index) => {
+    scheduleSfxTone(ctx, startAt + index * stagger, {
+      frequency,
+      type,
+      duration,
+      gain,
+      filterFrequency,
+      release,
+    });
+  });
+}
+
+function hexToRgba(value, alpha = 1) {
+  const text = String(value || "").trim();
+
+  if (!text) {
+    return `rgba(121, 201, 255, ${alpha})`;
+  }
+
+  if (text.startsWith("rgba(") || text.startsWith("rgb(")) {
+    return text.replace(/rgba?\(([^)]+)\)/, (_, raw) => {
+      const [r = 121, g = 201, b = 255] = raw
+        .split(",")
+        .map((part) => part.trim());
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    });
+  }
+
+  const normalized = text.replace("#", "");
+  const hex =
+    normalized.length === 3
+      ? normalized
+          .split("")
+          .map((part) => `${part}${part}`)
+          .join("")
+      : normalized;
+
+  if (!/^[0-9a-fA-F]{6}$/.test(hex)) {
+    return `rgba(121, 201, 255, ${alpha})`;
+  }
+
+  const r = Number.parseInt(hex.slice(0, 2), 16);
+  const g = Number.parseInt(hex.slice(2, 4), 16);
+  const b = Number.parseInt(hex.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function animateTextCount(element, start, end, duration = 620, suffix = "") {
+  if (!element) {
+    return;
+  }
+
+  let startTime = null;
+
+  function frame(currentTime) {
+    if (!startTime) {
+      startTime = currentTime;
+    }
+
+    const progress = Math.min((currentTime - startTime) / duration, 1);
+    const eased = 1 - Math.pow(1 - progress, 3);
+    const value = start + (end - start) * eased;
+    element.innerText = `${Math.round(value)}${suffix}`;
+
+    if (progress < 1) {
+      requestAnimationFrame(frame);
+    }
+  }
+
+  requestAnimationFrame(frame);
+}
+
+function animateTextSwap(element, nextText, options = {}) {
+  if (!element) {
+    return;
+  }
+
+  const normalizedText = String(nextText ?? "");
+  const currentText = element.dataset.displayText ?? element.innerText;
+  const fadeDelay = Number(options.fadeDelay ?? 90);
+  const settleDelay = Number(options.settleDelay ?? 240);
+
+  if (currentText === normalizedText) {
+    return;
+  }
+
+  if (element.__textFadeTimer) {
+    window.clearTimeout(element.__textFadeTimer);
+  }
+  if (element.__textSettleTimer) {
+    window.clearTimeout(element.__textSettleTimer);
+  }
+
+  element.dataset.displayText = normalizedText;
+  element.classList.remove("is-text-fade-in", "is-text-fade-out");
+  element.classList.add("is-text-fade-out");
+
+  element.__textFadeTimer = window.setTimeout(() => {
+    element.innerText = normalizedText;
+    element.classList.remove("is-text-fade-out");
+    element.classList.add("is-text-fade-in");
+    element.__textSettleTimer = window.setTimeout(() => {
+      element.classList.remove("is-text-fade-in");
+    }, settleDelay);
+  }, fadeDelay);
+}
+
+const latestPointPulsePlugin = {
+  id: "ncaiLatestPointPulse",
+  afterDatasetsDraw(chart) {
+    if (chart.config.type !== "line" || !chart.$latestPointPulse) {
+      return;
+    }
+
+    const pulse = chart.$latestPointPulse;
+    const meta = chart.getDatasetMeta(0);
+    const point = meta?.data?.[meta.data.length - 1];
+
+    if (!point) {
+      chart.$latestPointPulse = null;
+      return;
+    }
+
+    const duration = Number(pulse.duration ?? 1400);
+    const elapsed = performance.now() - pulse.start;
+    const progress = Math.min(Math.max(elapsed / duration, 0), 1);
+    const radius = 8 + progress * 18;
+    const innerRadius = 5 + progress * 4;
+    const alpha = 0.34 * (1 - progress);
+    const color =
+      pulse.color || chart.data.datasets?.[0]?.borderColor || "#79c9ff";
+    const ctx = chart.ctx;
+
+    ctx.save();
+    ctx.globalCompositeOperation = "screen";
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = hexToRgba(color, alpha);
+    ctx.fillStyle = hexToRgba(color, alpha * 0.32);
+
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, innerRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+
+    if (progress < 1) {
+      if (linePointPulseFrame) {
+        cancelAnimationFrame(linePointPulseFrame);
+      }
+      linePointPulseFrame = requestAnimationFrame(() => chart.draw());
+    } else {
+      chart.$latestPointPulse = null;
+      if (linePointPulseFrame) {
+        cancelAnimationFrame(linePointPulseFrame);
+        linePointPulseFrame = null;
+      }
+    }
+  },
+};
+
+if (typeof Chart !== "undefined") {
+  const pluginAlreadyRegistered = Chart.registry?.plugins
+    ?.getAll?.()
+    ?.some((plugin) => plugin.id === latestPointPulsePlugin.id);
+
+  if (!pluginAlreadyRegistered) {
+    Chart.register(latestPointPulsePlugin);
+  }
+}
+
 async function playSfx(soundKey, options = {}) {
   if (!canPlaySfx(soundKey, options.minInterval)) {
     return;
@@ -477,29 +663,29 @@ async function playSfx(soundKey, options = {}) {
     case "record-start":
       scheduleSfxTone(ctx, startAt, {
         frequency: 392,
-        endFrequency: 430,
+        endFrequency: 466.16,
         type: "triangle",
-        duration: 0.1,
-        gain: 0.11,
-        filterFrequency: 1500,
+        duration: 0.11,
+        gain: 0.095,
+        filterFrequency: 1650,
       });
-      scheduleSfxTone(ctx, startAt + 0.085, {
+      scheduleSfxTone(ctx, startAt + 0.07, {
         frequency: 523.25,
-        endFrequency: 587.33,
+        endFrequency: 659.25,
         type: "sine",
-        duration: 0.13,
-        gain: 0.13,
-        filterFrequency: 2200,
+        duration: 0.14,
+        gain: 0.115,
+        filterFrequency: 2300,
       });
       break;
     case "record-stop":
       scheduleSfxTone(ctx, startAt, {
-        frequency: 622.25,
-        endFrequency: 415.3,
+        frequency: 659.25,
+        endFrequency: 392,
         type: "triangle",
-        duration: 0.18,
-        gain: 0.1,
-        filterFrequency: 1400,
+        duration: 0.16,
+        gain: 0.08,
+        filterFrequency: 1350,
       });
       break;
     case "answer-ready":
@@ -546,51 +732,25 @@ async function playSfx(soundKey, options = {}) {
       break;
     }
     case "analysis-complete":
-      if (isElevatedRisk) {
-        scheduleSfxTone(ctx, startAt, {
-          frequency: 329.63,
+      scheduleSfxChord(
+        ctx,
+        startAt,
+        isElevatedRisk ? [329.63, 415.3, 554.37] : [392, 523.25, 659.25],
+        {
           type: "triangle",
-          duration: 0.16,
-          gain: 0.08,
-          filterFrequency: 1500,
-        });
-        scheduleSfxTone(ctx, startAt + 0.16, {
-          frequency: 440,
-          type: "triangle",
-          duration: 0.18,
-          gain: 0.08,
-          filterFrequency: 1500,
-        });
-        scheduleSfxTone(ctx, startAt + 0.31, {
-          frequency: 659.25,
-          type: "sine",
-          duration: 0.26,
-          gain: 0.11,
-          filterFrequency: 1800,
-        });
-      } else {
-        scheduleSfxTone(ctx, startAt, {
-          frequency: 392,
-          type: "triangle",
-          duration: 0.16,
-          gain: 0.08,
-          filterFrequency: 1700,
-        });
-        scheduleSfxTone(ctx, startAt + 0.12, {
-          frequency: 523.25,
-          type: "sine",
-          duration: 0.18,
-          gain: 0.09,
-          filterFrequency: 2000,
-        });
-        scheduleSfxTone(ctx, startAt + 0.24, {
-          frequency: 659.25,
-          type: "triangle",
-          duration: 0.28,
-          gain: 0.12,
-          filterFrequency: 2400,
-        });
-      }
+          duration: 0.24,
+          gain: isElevatedRisk ? 0.085 : 0.08,
+          stagger: 0,
+          filterFrequency: isElevatedRisk ? 1700 : 2200,
+        },
+      );
+      scheduleSfxTone(ctx, startAt + 0.18, {
+        frequency: isElevatedRisk ? 659.25 : 783.99,
+        type: "sine",
+        duration: 0.16,
+        gain: 0.06,
+        filterFrequency: 2600,
+      });
       break;
     case "warning-popup":
       scheduleSfxTone(ctx, startAt, {
@@ -611,53 +771,65 @@ async function playSfx(soundKey, options = {}) {
       });
       break;
     case "report-open":
-      scheduleSfxTone(ctx, startAt, {
-        frequency: 392,
+      scheduleSfxChord(ctx, startAt, [392, 523.25], {
         type: "sine",
-        duration: 0.12,
-        gain: 0.07,
-        filterFrequency: 2000,
+        duration: 0.13,
+        gain: 0.055,
+        stagger: 0.045,
+        filterFrequency: 2100,
       });
-      scheduleSfxTone(ctx, startAt + 0.07, {
-        frequency: 587.33,
+      scheduleSfxTone(ctx, startAt + 0.13, {
+        frequency: 698.46,
         type: "triangle",
-        duration: 0.18,
-        gain: 0.08,
-        filterFrequency: 2400,
+        duration: 0.14,
+        gain: 0.065,
+        filterFrequency: 2500,
       });
       break;
     case "report-close":
       scheduleSfxTone(ctx, startAt, {
-        frequency: 587.33,
-        endFrequency: 392,
+        frequency: 698.46,
+        endFrequency: 466.16,
         type: "sine",
-        duration: 0.14,
-        gain: 0.06,
-        filterFrequency: 1800,
+        duration: 0.12,
+        gain: 0.05,
+        filterFrequency: 1700,
+      });
+      break;
+    case "disclosure-open":
+      scheduleSfxChord(ctx, startAt, [415.3, 554.37], {
+        type: "triangle",
+        duration: 0.11,
+        gain: 0.045,
+        stagger: 0.04,
+        filterFrequency: 1900,
+      });
+      break;
+    case "disclosure-close":
+      scheduleSfxTone(ctx, startAt, {
+        frequency: 554.37,
+        endFrequency: 369.99,
+        type: "sine",
+        duration: 0.13,
+        gain: 0.045,
+        filterFrequency: 1650,
       });
       break;
     case "reset-history":
-      scheduleSfxTone(ctx, startAt, {
-        frequency: 523.25,
+      scheduleSfxChord(ctx, startAt, [523.25, 392, 293.66], {
         type: "triangle",
         duration: 0.12,
-        gain: 0.07,
-        filterFrequency: 1500,
-      });
-      scheduleSfxTone(ctx, startAt + 0.11, {
-        frequency: 392,
-        type: "triangle",
-        duration: 0.12,
-        gain: 0.07,
-        filterFrequency: 1400,
+        gain: 0.055,
+        stagger: 0.07,
+        filterFrequency: 1450,
       });
       scheduleSfxTone(ctx, startAt + 0.22, {
-        frequency: 293.66,
-        endFrequency: 220,
+        frequency: 246.94,
+        endFrequency: 196,
         type: "sine",
-        duration: 0.2,
-        gain: 0.08,
-        filterFrequency: 1200,
+        duration: 0.22,
+        gain: 0.07,
+        filterFrequency: 1180,
       });
       break;
     case "mode-switch":
@@ -856,9 +1028,83 @@ function scheduleNumberAnimation(
   scoreCascadeTimers.push(timerId);
 }
 
+function clearRoleChipTimer(role) {
+  const timers = roleChipAnimationTimers.get(role) || [];
+  timers.forEach((timerId) => window.clearTimeout(timerId));
+  roleChipAnimationTimers.delete(role);
+}
+
+function queueRoleChipTimer(role, timerId) {
+  if (!roleChipAnimationTimers.has(role)) {
+    roleChipAnimationTimers.set(role, []);
+  }
+  roleChipAnimationTimers.get(role).push(timerId);
+}
+
+function getRoleChip(role) {
+  return analysisRoleChips.find((chip) => chip.dataset.role === role) || null;
+}
+
+function setRoleChipAnalyzing(role, completedCount = 0, totalCount = 4) {
+  analysisRoleChips.forEach((chip) => {
+    const currentRole = chip.dataset.role;
+    const stateEl = chip.querySelector("small");
+
+    chip.classList.remove("is-active");
+
+    if (currentRole !== role || chip.classList.contains("is-complete")) {
+      return;
+    }
+
+    clearRoleChipTimer(currentRole);
+    chip.classList.remove("is-locking", "is-locked", "is-pulse");
+    chip.classList.add("is-active");
+    if (stateEl) {
+      stateEl.innerText = `${completedCount}/${totalCount} 분석 중`;
+    }
+  });
+}
+
+function lockRoleChip(role, score) {
+  const chip = getRoleChip(role);
+  const stateEl = chip?.querySelector("small");
+
+  if (!chip || !stateEl) {
+    return;
+  }
+
+  clearRoleChipTimer(role);
+  chip.classList.remove("is-active", "is-locked", "is-complete", "is-pulse");
+  chip.classList.add("is-locking");
+  stateEl.innerText = "분석 중";
+
+  const countUpTimer = window.setTimeout(() => {
+    chip.classList.add("is-score-revealing");
+    animateTextCount(stateEl, 0, Number(score ?? 0), 620, "점");
+  }, 180);
+
+  const lockedTimer = window.setTimeout(() => {
+    chip.classList.remove("is-locking", "is-score-revealing");
+    chip.classList.add("is-complete", "is-locked");
+    stateEl.innerText = `${Number(score ?? 0)}점`;
+    pulseElement(chip, "is-pulse", 840);
+  }, 960);
+
+  queueRoleChipTimer(role, countUpTimer);
+  queueRoleChipTimer(role, lockedTimer);
+}
+
 function resetRoleAnalysisTracker() {
   analysisRoleChips.forEach((chip) => {
-    chip.classList.remove("is-active", "is-complete", "is-pulse");
+    clearRoleChipTimer(chip.dataset.role);
+    chip.classList.remove(
+      "is-active",
+      "is-complete",
+      "is-pulse",
+      "is-locking",
+      "is-locked",
+      "is-score-revealing",
+    );
     const stateEl = chip.querySelector("small");
     if (stateEl) {
       stateEl.innerText = "대기";
@@ -881,10 +1127,11 @@ function updateRoleAnalysisTracker(
     const result = role ? roleResults?.[role] : null;
     const stateEl = chip.querySelector("small");
 
-    chip.classList.remove("is-active", "is-complete");
+    chip.classList.remove("is-active", "is-complete", "is-locking");
 
     if (finalized && role) {
-      chip.classList.add("is-complete");
+      clearRoleChipTimer(role);
+      chip.classList.add("is-complete", "is-locked");
       if (stateEl) {
         const score =
           roleResults?.[role] &&
@@ -897,7 +1144,7 @@ function updateRoleAnalysisTracker(
     }
 
     if (result) {
-      chip.classList.add("is-complete");
+      chip.classList.add("is-complete", "is-locked");
       if (stateEl) {
         stateEl.innerText = `${Number(result.score ?? 0)}점`;
       }
@@ -944,23 +1191,41 @@ function focusSelectedTurnFeedback(turnId) {
 
 function triggerAnalysisScoreCascade(data) {
   clearScoreCascadeTimers();
-
-  const cascadeTargets = [
+  const riskColor = getRiskInfo(
+    Number(data?.recent_average_score ?? data?.score ?? 0),
+  ).color;
+  const pulseTargets = [
     { element: latestScoreCardEl, delay: 40 },
-    { element: statusCardEl, delay: 180 },
-    { element: gaugeCardEl, delay: 320 },
-    { element: lineChartCardEl, delay: 460 },
-    { element: analysisDetailCardEl, delay: 600 },
-    { element: analysisHeroCardEl, delay: 740 },
+    {
+      element: analysisHeroScoreEl,
+      delay: 40,
+      className: "is-value-spotlight",
+    },
+    {
+      element: analysisHeroBadgeEl,
+      delay: 230,
+      className: "is-badge-spotlight",
+    },
+    {
+      element: analysisStateBadgeEl,
+      delay: 230,
+      className: "is-badge-spotlight",
+    },
+    { element: analysisHeroCardEl, delay: 430 },
+    { element: analysisDetailCardEl, delay: 620 },
+    { element: analysisReasonBoxEl, delay: 620, className: "is-focus-tracked" },
+    { element: gaugeCardEl, delay: 810 },
+    { element: lineChartCardEl, delay: 980 },
   ];
 
-  cascadeTargets.forEach(({ element, delay }) => {
-    scheduleCascadePulse(element, delay);
+  pulseTargets.forEach(({ element, delay, className }) => {
+    scheduleCascadePulse(element, delay, className);
   });
 
-  if ((data?.score ?? 0) > 0) {
-    scheduleCascadePulse(analysisReasonBoxEl, 860, "is-focus-tracked");
-  }
+  const chartPulseTimer = window.setTimeout(() => {
+    triggerLatestLinePointPulse(riskColor);
+  }, 980);
+  scoreCascadeTimers.push(chartPulseTimer);
 }
 
 function setMobileProcessBadge(text, tone = "idle") {
@@ -1014,6 +1279,18 @@ function setVoiceLevel(level = 0.06) {
   document.documentElement.style.setProperty(
     "--voice-wave-front-peak",
     (1.08 + normalizedLevel * 0.34).toFixed(3),
+  );
+  document.documentElement.style.setProperty(
+    "--record-voice-glow",
+    `${(10 + normalizedLevel * 26).toFixed(2)}px`,
+  );
+  document.documentElement.style.setProperty(
+    "--record-label-shift",
+    `${(-0.4 - normalizedLevel * 1.2).toFixed(2)}px`,
+  );
+  document.documentElement.style.setProperty(
+    "--record-label-scale",
+    (1 + normalizedLevel * 0.022).toFixed(3),
   );
 }
 
@@ -1181,6 +1458,9 @@ function registerDisclosureSurface(detailsEl) {
     }
 
     detailsEl.dataset.userToggled = "true";
+    void playSfx(detailsEl.open ? "disclosure-open" : "disclosure-close", {
+      minInterval: 100,
+    });
 
     if (detailsEl.open) {
       window.requestAnimationFrame(() => {
@@ -2586,7 +2866,7 @@ async function runAnalysisTask(task) {
       setThinkingMessage(
         `${roleLabel}에 대한 점수와 근거를 정리하고 있습니다.`,
       );
-      updateRoleAnalysisTracker(roleResults, role, index, totalRoles);
+      setRoleChipAnalyzing(role, index, totalRoles);
 
       const roleData = await requestRoleAnalysis(
         task.recognizedText,
@@ -2615,6 +2895,7 @@ async function runAnalysisTask(task) {
         score: Number(roleResults[role].score ?? 0),
         minInterval: 180,
       });
+      lockRoleChip(role, Number(roleResults[role].score ?? 0));
       applyProgressiveAnalysisPreview(roleResults, role, index + 1, totalRoles);
       applyProgressiveSummaryPreview(roleResults);
     }
@@ -2710,7 +2991,7 @@ function updateRecordToggleButton() {
   startButton.dataset.recordState = "idle";
 
   if (isAnswerPending) {
-    startButton.innerText = recordButtonBusyLabel || "답변 생성 중...";
+    setRecordButtonLabel(recordButtonBusyLabel || "답변 생성 중...");
     startButton.disabled = true;
     startButton.classList.add("secondary-btn", "is-processing");
     startButton.dataset.recordState = "processing";
@@ -2718,14 +2999,14 @@ function updateRecordToggleButton() {
   }
 
   if (isCurrentlyRecording) {
-    startButton.innerText = "녹음 중지";
+    setRecordButtonLabel("녹음 중지");
     startButton.disabled = false;
     startButton.classList.add("danger-btn", "is-recording");
     startButton.dataset.recordState = "recording";
     return;
   }
 
-  startButton.innerText = "녹음 시작";
+  setRecordButtonLabel("녹음 시작");
   startButton.disabled = false;
   startButton.classList.add("primary-btn");
   startButton.dataset.recordState = "idle";
@@ -2971,9 +3252,26 @@ function clearChatEmptyState() {
   }
 }
 
+function setRecordButtonLabel(label) {
+  if (!startButton) {
+    return;
+  }
+
+  let labelEl = startButton.querySelector(".record-btn-label");
+  if (!labelEl) {
+    startButton.textContent = "";
+    labelEl = document.createElement("span");
+    labelEl.className = "record-btn-label";
+    startButton.appendChild(labelEl);
+  }
+
+  labelEl.innerText = label;
+  startButton.setAttribute("aria-label", label);
+}
+
 function setThinkingMessage(text) {
   if (aiThinking) {
-    aiThinking.innerText = text;
+    animateTextSwap(aiThinking, text);
   }
   refreshWorkspaceOverviewSurface();
 }
@@ -3049,9 +3347,7 @@ function setProcessState(step, detail = "") {
     }
   });
 
-  if (processDetailEl) {
-    processDetailEl.innerText = detail || "처리 중입니다.";
-  }
+  animateTextSwap(processDetailEl, detail || "처리 중입니다.");
 
   setMobileProcessBadge(processStepLabels[step] || "처리 중", "active");
 }
@@ -3068,9 +3364,7 @@ function setProcessError(detail) {
     active.classList.add("is-error");
   }
 
-  if (processDetailEl) {
-    processDetailEl.innerText = detail || "오류가 발생했습니다.";
-  }
+  animateTextSwap(processDetailEl, detail || "오류가 발생했습니다.");
 
   setMobileProcessBadge("오류", "error");
 }
@@ -3082,9 +3376,7 @@ function resetProcessState(detail = "대기 중입니다.") {
 
   resetRoleAnalysisTracker();
 
-  if (processDetailEl) {
-    processDetailEl.innerText = detail;
-  }
+  animateTextSwap(processDetailEl, detail);
 
   setMobileProcessBadge("대기", "idle");
 }
@@ -3302,9 +3594,7 @@ function setAnalysisThinking(isThinking) {
 }
 
 function setSystemState(text) {
-  if (systemStateText) {
-    systemStateText.innerText = text;
-  }
+  animateTextSwap(systemStateText, text);
   refreshWorkspaceOverviewSurface();
 }
 
@@ -3447,7 +3737,13 @@ function isScoreIncluded(data) {
 
 function setAnalysisStateBadge(label, tone = "idle", hintText = "") {
   if (analysisStateBadgeEl) {
-    analysisStateBadgeEl.innerText = label;
+    const previousTone = Array.from(analysisStateBadgeEl.classList).find(
+      (name) => name.startsWith("is-"),
+    );
+    animateTextSwap(analysisStateBadgeEl, label, {
+      fadeDelay: 70,
+      settleDelay: 220,
+    });
     analysisStateBadgeEl.classList.remove(
       "is-idle",
       "is-complete",
@@ -3456,10 +3752,17 @@ function setAnalysisStateBadge(label, tone = "idle", hintText = "") {
       "is-cancelled",
     );
     analysisStateBadgeEl.classList.add(`is-${tone}`);
+    if (
+      previousTone !== `is-${tone}` ||
+      analysisStateBadgeEl.dataset.lastLabel !== label
+    ) {
+      pulseElement(analysisStateBadgeEl, "is-badge-spotlight", 760);
+    }
+    analysisStateBadgeEl.dataset.lastLabel = label;
   }
 
   if (analysisEmptyHintEl) {
-    analysisEmptyHintEl.innerText = hintText;
+    animateTextSwap(analysisEmptyHintEl, hintText);
     analysisEmptyHintEl.classList.toggle("is-hidden", !hintText);
   }
 }
@@ -3515,26 +3818,20 @@ function applyProgressiveAnalysisPreview(
   const preview = buildProgressiveAnalysisPreview(roleResults);
   const roleLabel = analysisRoleLabels[currentRole] || "세부 분석";
 
-  if (analysisJudgmentEl) analysisJudgmentEl.innerText = "분석 중";
+  if (analysisJudgmentEl) animateTextSwap(analysisJudgmentEl, "분석 중");
   if (analysisRiskLevelEl)
-    analysisRiskLevelEl.innerText = getRiskLevelFromScore(preview.score);
-  if (analysisTrendEl) analysisTrendEl.innerText = "진행 중";
+    animateTextSwap(analysisRiskLevelEl, getRiskLevelFromScore(preview.score));
+  if (analysisTrendEl) animateTextSwap(analysisTrendEl, "진행 중");
   if (analysisReasonEl) {
-    analysisReasonEl.innerText = preview.reason;
+    animateTextSwap(analysisReasonEl, preview.reason, {
+      fadeDelay: 60,
+      settleDelay: 220,
+    });
   }
 
   setAnalysisScoreDisplay(preview.score, true);
   updateFeatureBreakdown(preview.featureScores);
   updateConfidence(preview.featureScores, preview.score, true);
-  updateRoleAnalysisTracker(
-    roleResults,
-    currentRole,
-    completedCount,
-    totalCount,
-    {
-      animateRole: currentRole,
-    },
-  );
   setAnalysisStateBadge(
     `${roleLabel} 반영`,
     "complete",
@@ -3584,10 +3881,15 @@ function updateAnalysisCard(data) {
     : "채팅 기록을 클릭하면 해당 시점의 분석 결과를 다시 볼 수 있습니다.";
 
   if (analysisJudgmentEl)
-    analysisJudgmentEl.innerText = data.judgment || "없음";
-  if (analysisRiskLevelEl) analysisRiskLevelEl.innerText = riskLabel;
-  if (analysisTrendEl) analysisTrendEl.innerText = trendLabel;
-  if (analysisReasonEl) analysisReasonEl.innerText = reasonText;
+    animateTextSwap(analysisJudgmentEl, data.judgment || "없음");
+  if (analysisRiskLevelEl) animateTextSwap(analysisRiskLevelEl, riskLabel);
+  if (analysisTrendEl) animateTextSwap(analysisTrendEl, trendLabel);
+  if (analysisReasonEl) {
+    animateTextSwap(analysisReasonEl, reasonText, {
+      fadeDelay: 70,
+      settleDelay: 240,
+    });
+  }
   setAnalysisStateBadge(badgeLabel, badgeTone, hintText);
 }
 
@@ -3954,6 +4256,23 @@ function revealSummaryNumbers(data) {
 function revealAnalysisWithCountUp(data) {
   revealSummaryNumbers(data);
   triggerAnalysisScoreCascade(data);
+}
+
+function triggerLatestLinePointPulse(color) {
+  if (
+    !scoreChart ||
+    !Array.isArray(scoreHistory) ||
+    scoreHistory.length === 0
+  ) {
+    return;
+  }
+
+  scoreChart.$latestPointPulse = {
+    start: performance.now(),
+    duration: 1450,
+    color,
+  };
+  scoreChart.draw();
 }
 
 function setAnalysisLoadingState(isLoading) {
@@ -4569,6 +4888,7 @@ function updateStatusCard(recentAverageScore) {
   }
 
   const risk = getRiskInfo(recentAverageScore);
+  const previousRiskKey = statusCard.dataset.riskIconKey || "";
 
   statusCard.classList.remove(
     "risk-safe",
@@ -4581,6 +4901,7 @@ function updateStatusCard(recentAverageScore) {
 
   riskText.innerText = risk.text;
   riskDescription.innerText = risk.desc;
+  statusCard.dataset.riskIconKey = risk.iconKey;
 
   if (
     statusVisualImage &&
@@ -4589,6 +4910,15 @@ function updateStatusCard(recentAverageScore) {
   ) {
     statusVisualImage.src = THREE_D_ICON_PATHS.status[risk.iconKey];
     statusVisualImage.alt = risk.iconAlt;
+  }
+
+  if (statusVisual && previousRiskKey && previousRiskKey !== risk.iconKey) {
+    statusVisual.classList.remove("is-risk-shift");
+    void statusVisual.offsetWidth;
+    statusVisual.classList.add("is-risk-shift");
+    window.setTimeout(() => {
+      statusVisual.classList.remove("is-risk-shift");
+    }, 520);
   }
 }
 
@@ -4629,8 +4959,21 @@ function updateLineChart(recentAverageScore) {
             borderColor: risk.color,
             backgroundColor: risk.color,
             borderWidth: 3,
-            pointRadius: 4,
-            pointHoverRadius: 6,
+            pointRadius: scores.map((_, index) =>
+              index === scores.length - 1 ? 5 : 4,
+            ),
+            pointHoverRadius: scores.map((_, index) =>
+              index === scores.length - 1 ? 7 : 6,
+            ),
+            pointBackgroundColor: scores.map((_, index) =>
+              index === scores.length - 1 ? "#f7fbff" : risk.color,
+            ),
+            pointBorderColor: scores.map((_, index) =>
+              index === scores.length - 1 ? risk.color : risk.color,
+            ),
+            pointBorderWidth: scores.map((_, index) =>
+              index === scores.length - 1 ? 3 : 2,
+            ),
             tension: 0.35,
             fill: false,
           },
@@ -4682,6 +5025,19 @@ function updateLineChart(recentAverageScore) {
   scoreChart.data.datasets[0].data = scores;
   scoreChart.data.datasets[0].borderColor = risk.color;
   scoreChart.data.datasets[0].backgroundColor = risk.color;
+  scoreChart.data.datasets[0].pointRadius = scores.map((_, index) =>
+    index === scores.length - 1 ? 5 : 4,
+  );
+  scoreChart.data.datasets[0].pointHoverRadius = scores.map((_, index) =>
+    index === scores.length - 1 ? 7 : 6,
+  );
+  scoreChart.data.datasets[0].pointBackgroundColor = scores.map((_, index) =>
+    index === scores.length - 1 ? "#f7fbff" : risk.color,
+  );
+  scoreChart.data.datasets[0].pointBorderColor = scores.map(() => risk.color);
+  scoreChart.data.datasets[0].pointBorderWidth = scores.map((_, index) =>
+    index === scores.length - 1 ? 3 : 2,
+  );
   scoreChart.data.datasets[1].data = scoreHistory.map(() => 30);
   scoreChart.data.datasets[2].data = scoreHistory.map(() => 60);
   scoreChart.update();

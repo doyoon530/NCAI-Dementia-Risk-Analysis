@@ -1275,9 +1275,15 @@ body::after {
 
 .status-label,
 .mini-title,
-.analysis-title,
 .workspace-overview-label,
-.panel-disclosure-kicker,
+.panel-disclosure-kicker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.analysis-title,
 .analysis-hero-score-label,
 .analysis-hero-metric span {
   position: relative;
@@ -1288,9 +1294,12 @@ body::after {
 
 .status-label::before,
 .mini-title::before,
-.analysis-title::before,
 .workspace-overview-label::before,
-.panel-disclosure-kicker::before,
+.panel-disclosure-kicker::before {
+  display: none;
+}
+
+.analysis-title::before,
 .analysis-hero-score-label::before,
 .analysis-hero-metric span::before {
   content: "";

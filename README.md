@@ -24,6 +24,10 @@ Dr.지누는 대화형 음성 인터페이스를 통해 인지 위험 신호를 
 
 > 시연 영상: [Dr.지누 Demo Video](https://youtu.be/DrihQEexQAg)
 
+<p align="center">
+  <img src="docs/images/hero-live-demo.gif" alt="Dr.지누 live interaction demo" width="100%" />
+</p>
+
 ---
 
 ## Why Dr.지누 / Why It Matters
@@ -194,6 +198,13 @@ flowchart TD
 ## Interface / 화면 구성
 
 > 좌측 summary, 중앙 conversation flow, 우측 analysis panel의 3열 구조를 중심으로 인터페이스를 설계하였다.
+
+### Interactive Highlights
+
+| Live Conversation Flow                                                                         | Report & Detail Interaction                                                                      |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| ![Live conversation flow](docs/images/hero-live-demo.gif)                                      | ![Report and detail interaction](docs/images/report-live-demo.gif)                               |
+| 녹음 시작 이후 답변 생성과 역할별 점수 반영이 이어지는 핵심 흐름을 인터랙션 중심으로 보여준다. | 세부 분석, 기록 패널, 세션 리포트 모달이 어떻게 연결되는지 마우스 이동과 클릭 중심으로 보여준다. |
 
 ### Product Flow
 

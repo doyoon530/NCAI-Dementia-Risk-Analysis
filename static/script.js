@@ -49,6 +49,7 @@ const llmModeLocalButton = document.getElementById("llmModeLocal");
 const llmModeApiButton = document.getElementById("llmModeApi");
 const llmModeStatusEl = document.getElementById("llmModeStatus");
 const llmModeHintEl = document.getElementById("llmModeHint");
+const logoutButton = document.getElementById("logoutButton");
 const chatContainer = document.getElementById("chatContainer");
 const chatWindow = document.getElementById("chatWindow");
 const recordingIndicator = document.getElementById("recordingIndicator");
@@ -84,7 +85,6 @@ const analysisStateBadgeEl = document.getElementById("analysisStateBadge");
 const analysisEmptyHintEl = document.getElementById("analysisEmptyHint");
 const analysisDetailCardEl =
   analysisStateBadgeEl?.closest(".analysis-card") || null;
-const analysisReasonBoxEl = analysisReasonEl || null;
 const analysisHeroCardEl = document.querySelector(".analysis-hero-card");
 
 const featureRepetitionValueEl = document.getElementById(
@@ -1188,7 +1188,7 @@ function focusSelectedTurnFeedback(turnId) {
   }
 
   pulseElement(analysisDetailCardEl, "is-focus-tracked", 1100);
-  pulseElement(analysisReasonBoxEl, "is-focus-tracked", 1100);
+  pulseElement(analysisReasonEl, "is-focus-tracked", 1100);
 }
 
 function triggerAnalysisScoreCascade(data) {
@@ -1215,7 +1215,7 @@ function triggerAnalysisScoreCascade(data) {
     },
     { element: analysisHeroCardEl, delay: 430 },
     { element: analysisDetailCardEl, delay: 620 },
-    { element: analysisReasonBoxEl, delay: 620, className: "is-focus-tracked" },
+    { element: analysisReasonEl, delay: 620, className: "is-focus-tracked" },
     { element: gaugeCardEl, delay: 810 },
     { element: lineChartCardEl, delay: 980 },
   ];
@@ -1319,9 +1319,30 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadScoreHistory();
 });
 
+async function logoutSession() {
+  try {
+    logoutButton?.setAttribute("disabled", "true");
+    const response = await fetch("/logout", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...buildVisitorHeaders(),
+      },
+    });
+    const payload = await response.json().catch(() => ({}));
+    window.location.href = payload.redirect || "/login";
+  } catch (error) {
+    console.error("logout failed", error);
+    window.location.href = "/login";
+  } finally {
+    logoutButton?.removeAttribute("disabled");
+  }
+}
+
 function bindEvents() {
   if (startButton) startButton.onclick = toggleRecording;
   if (resetButton) resetButton.onclick = resetHistory;
+  if (logoutButton) logoutButton.onclick = logoutSession;
   if (openSessionReportButton)
     openSessionReportButton.onclick = openSessionReport;
   if (mobileOpenSessionReportButton)
@@ -4481,11 +4502,18 @@ function applyAnalysisResult(data, options = {}) {
   }
 
   if (Array.isArray(data?.score_history)) {
+    // Full replacement — used by /score-history (page load) and /reset-history.
     scoreHistory = data.score_history;
+  } else if (data?.new_score_entry) {
+    // Incremental: per-message response sends only the new entry.
+    // Trim to MAX_SCORE_HISTORY (30) to mirror server-side deque limit.
+    scoreHistory = [...scoreHistory, data.new_score_entry].slice(-30);
   }
   if (Array.isArray(data?.turn_history)) {
+    // Full replacement — backward compat for any endpoint that still sends it.
     turnHistory = data.turn_history;
   }
+  // data.turn incremental merge is handled below (lines ~4535-4543).
   if (options.finalizedClientTurnId) {
     removePendingTurn(options.finalizedClientTurnId);
   }

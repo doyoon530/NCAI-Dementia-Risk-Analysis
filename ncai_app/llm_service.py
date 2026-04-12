@@ -1,6 +1,9 @@
 import json
+import logging
 import os
+import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -22,8 +25,6 @@ from .config import (
     analysis_prompt,
     analysis_retry_prompt,
     answer_prompt,
-    feature_analysis_prompt,
-    feature_analysis_retry_prompt,
     get_analysis_max_tokens,
     get_analysis_n_batch,
     get_analysis_n_ctx,
@@ -32,11 +33,14 @@ from .config import (
     get_api_llm_base_url,
     get_api_llm_timeout,
     get_default_llm_provider,
+    get_ffmpeg_timeout_seconds,
     get_model_path,
     is_api_llm_configured,
     normalize_llm_provider,
     repetition_prompt,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def setup_google_credentials() -> str | None:
@@ -193,30 +197,47 @@ def invoke_api_chat_completion(
     if stop:
         payload["stop"] = stop
 
-    request_obj = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
+    _RATE_LIMIT_MAX_RETRIES = 3
+    _RATE_LIMIT_BASE_DELAY = 2.0  # seconds; doubles on each retry
 
-    try:
-        with urllib.request.urlopen(
-            request_obj, timeout=get_api_llm_timeout()
-        ) as response:
-            response_payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        error_body = ""
+    response_payload = None
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES):
         try:
-            error_body = error.read().decode("utf-8")
-        except Exception:
-            error_body = str(error)
-        raise RuntimeError(f"외부 API 호출이 실패했습니다. {error_body}") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError("외부 API 서버에 연결하지 못했습니다.") from error
+            # urllib.request.Request is not reusable after urlopen on some versions;
+            # rebuild on each attempt so headers/body remain intact.
+            current_request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(
+                current_request, timeout=get_api_llm_timeout()
+            ) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+            break  # success
+        except urllib.error.HTTPError as error:
+            if error.code == 429 and attempt < _RATE_LIMIT_MAX_RETRIES - 1:
+                # Respect Retry-After header if present, otherwise use exponential backoff
+                retry_after = error.headers.get("Retry-After", "")
+                delay = float(retry_after) if retry_after.isdigit() else _RATE_LIMIT_BASE_DELAY * (2 ** attempt)
+                logger.warning("API rate limit (429) — waiting %.1fs before retry %d/%d", delay, attempt + 1, _RATE_LIMIT_MAX_RETRIES)
+                time.sleep(delay)
+                continue
+            error_body = ""
+            try:
+                error_body = error.read().decode("utf-8")
+            except Exception:
+                error_body = str(error)
+            raise RuntimeError(f"외부 API 호출이 실패했습니다. {error_body}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError("외부 API 서버에 연결하지 못했습니다.") from error
+
+    if response_payload is None:
+        raise RuntimeError("외부 API rate limit으로 인해 모든 재시도가 실패했습니다.")
 
     choices = response_payload.get("choices") or []
     if not choices:
@@ -279,8 +300,6 @@ def get_or_create_analysis_chains():
         runtime.analysis_chain is not None
         and runtime.analysis_retry_chain is not None
         and runtime.analysis_repetition_chain is not None
-        and runtime.analysis_feature_chain is not None
-        and runtime.analysis_feature_retry_chain is not None
     ):
         return runtime.analysis_chain, runtime.analysis_retry_chain
 
@@ -313,15 +332,6 @@ def get_or_create_analysis_chains():
         runtime.analysis_repetition_chain = LLMChain(
             prompt=repetition_prompt, llm=runtime.analysis_llm_instance
         )
-    if runtime.analysis_feature_chain is None:
-        runtime.analysis_feature_chain = LLMChain(
-            prompt=feature_analysis_prompt, llm=runtime.analysis_llm_instance
-        )
-    if runtime.analysis_feature_retry_chain is None:
-        runtime.analysis_feature_retry_chain = LLMChain(
-            prompt=feature_analysis_retry_prompt, llm=runtime.analysis_llm_instance
-        )
-
     return runtime.analysis_chain, runtime.analysis_retry_chain
 
 
@@ -329,15 +339,6 @@ def get_or_create_repetition_chain():
     if runtime.analysis_repetition_chain is None:
         get_or_create_analysis_chains()
     return runtime.analysis_repetition_chain
-
-
-def get_or_create_feature_analysis_chains():
-    if (
-        runtime.analysis_feature_chain is None
-        or runtime.analysis_feature_retry_chain is None
-    ):
-        get_or_create_analysis_chains()
-    return runtime.analysis_feature_chain, runtime.analysis_feature_retry_chain
 
 
 def get_or_create_role_analysis_chains(role_key: str):
@@ -389,24 +390,73 @@ def get_or_create_speech_client():
     return runtime.speech_client
 
 
+def convert_audio_to_wav(file_path: str) -> str:
+    fd, wav_path = tempfile.mkstemp(prefix="stt-audio-", suffix=".wav")
+    os.close(fd)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        file_path,
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        wav_path,
+    ]
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=get_ffmpeg_timeout_seconds(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+        raise RuntimeError(
+            f"Audio conversion timed out for '{os.path.basename(file_path)}'"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+        raise RuntimeError(
+            f"Audio conversion failed for '{os.path.basename(file_path)}': {exc.stderr.strip()}"
+        ) from exc
+
+    return wav_path
+
+
 def transcribe_audio_file(file_path: str) -> str:
     client = get_or_create_speech_client()
+    wav_path = convert_audio_to_wav(file_path)
 
-    with open(file_path, "rb") as file_handle:
-        content = file_handle.read()
+    try:
+        with open(wav_path, "rb") as file_handle:
+            content = file_handle.read()
 
-    audio = speech.RecognitionAudio(content=content)
-    config = speech.RecognitionConfig(
-        language_code="ko-KR",
-        enable_automatic_punctuation=True,
-        max_alternatives=3,
-    )
+        audio = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=16000,
+            language_code="ko-KR",
+            enable_automatic_punctuation=True,
+            max_alternatives=3,
+        )
 
-    response = client.recognize(config=config, audio=audio)
+        response = client.recognize(config=config, audio=audio)
 
-    transcripts = []
-    for result in response.results:
-        if result.alternatives:
-            transcripts.append(result.alternatives[0].transcript)
+        transcripts = []
+        for result in response.results:
+            if result.alternatives:
+                transcripts.append(result.alternatives[0].transcript)
 
-    return normalize_text(" ".join(transcripts))
+        return normalize_text(" ".join(transcripts))
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)

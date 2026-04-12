@@ -1,4 +1,6 @@
+import hashlib
 import os
+import secrets
 import socket
 
 from flask import Flask
@@ -18,13 +20,60 @@ except ImportError:
     serve = None
 
 
+def load_local_env() -> None:
+    for filename in (".env.local", ".env"):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        if not os.path.exists(path):
+            continue
+
+        with open(path, encoding="utf-8-sig") as env_file:
+            for line in env_file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_local_env()
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.config["SECRET_KEY"] = os.getenv("NCAI_SECRET_KEY") or secrets.token_hex(32)
 app.config["JSON_AS_ASCII"] = False
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+secure_cookie = os.getenv("SESSION_COOKIE_SECURE", "").strip().lower()
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = (
+    secure_cookie in {"1", "true", "yes", "on"}
+    or bool(os.getenv("CLOUDFLARE_PUBLIC_HOSTNAME", "").strip())
+)
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 register_routes(app)
+
+
+def _compute_static_ver(filename: str) -> str:
+    path = os.path.join(app.static_folder, filename)
+    try:
+        mtime = str(os.path.getmtime(path)).encode()
+        return hashlib.md5(mtime).hexdigest()[:8]
+    except OSError:
+        return "0"
+
+
+_static_ver_cache: dict[str, str] = {}
+
+
+def _static_ver(filename: str) -> str:
+    if filename not in _static_ver_cache:
+        _static_ver_cache[filename] = _compute_static_ver(filename)
+    return _static_ver_cache[filename]
+
+
+@app.context_processor
+def inject_static_ver():
+    return {"static_ver": _static_ver}
 
 
 def get_local_ip() -> str:

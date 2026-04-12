@@ -175,6 +175,8 @@ cython_debug/
 
 # Node.js dependencies
 node_modules/
+frontend/*/node_modules/
+frontend/*/dist/
 
 # PyPI configuration file
 .pypirc
@@ -194,12 +196,34 @@ stt-bot-*.json
 
 # Runtime uploads
 uploads/
+data/*.db
+data/*.sqlite
+data/*.sqlite3
 
 # Local-only demo / capture assets
 static/local-runtime.local.js
 scripts/*.local.mjs
-docs/.tmp/
 docs/media/
 docs/images/demo-flow.gif
 docs/ppt-work/
 ffprobe*.log
+
+# Frontend build metadata (vite manifest)
+static/login/.vite/
+static/team/.vite/
+.githooks/
+local/
+
+# Local-only login / team pages
+frontend/
+templates/login.html
+templates/team.html
+templates/admin_visitors.html
+templates/admin*.html
+static/login/
+static/team/
+static/admin/
+static/images/admin/
+scripts/build-login.mjs
+scripts/build-team.mjs
+scripts/build-admin.mjs

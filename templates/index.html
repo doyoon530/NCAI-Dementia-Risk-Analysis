@@ -4,7 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>대화하며 진단하는 치매 케어 AI "Dr.지누"</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <link
+      rel="stylesheet"
+      href="/static/style.css?v={{ static_ver('style.css') }}"
+    />
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   </head>
   <body>
@@ -156,7 +159,7 @@
             class="record-btn secondary-btn"
             type="button"
           >
-            異쒕젰
+            출력
           </button>
           <button
             id="closeSessionReportFooter"
@@ -207,6 +210,21 @@
           <div class="mode-card-hint" id="llmModeHint">
             현재 컴퓨터에 있는 로컬 모델로 답변과 분석을 수행합니다.
           </div>
+        </div>
+
+        <div class="auth-session-card glass-card">
+          <div class="auth-session-copy">
+            <div class="auth-session-title">현재 사용자</div>
+            <div class="auth-session-name" id="operatorName">
+              {{ operator_name or "사용자" }}
+            </div>
+            <div class="auth-session-id" id="operatorId">
+              {{ operator_id or "-" }}
+            </div>
+          </div>
+          <button id="logoutButton" class="auth-logout-button" type="button">
+            로그아웃
+          </button>
         </div>
 
         <div class="status-card glass-strong" id="statusCard">
@@ -936,6 +954,6 @@
       </button>
     </nav>
 
-    <script src="/static/script.js"></script>
+    <script src="/static/script.js?v={{ static_ver('script.js') }}"></script>
   </body>
 </html>

@@ -2,8 +2,8 @@
 @import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.3/dist/web/static/pretendard.css");
 
 :root {
-  --gnu-blue: #1897d1;
-  --gnu-blue-rgb: 24, 151, 209;
+  --gnu-blue: #e86fa3;
+  --gnu-blue-rgb: 232, 111, 163;
   --gnu-grey: #596168;
   --gnu-grey-rgb: 89, 97, 104;
   --gnu-silver: #b9b8bb;
@@ -15,19 +15,19 @@
   --luce-metal-rgb: 199, 194, 181;
   --luce-graphite: #202833;
   --luce-graphite-rgb: 32, 40, 51;
-  --bg: #07111f;
-  --bg-deep: #020712;
-  --panel: rgba(11, 19, 35, 0.8);
-  --panel-strong: rgba(16, 27, 48, 0.9);
-  --card: rgba(12, 21, 38, 0.84);
-  --stroke: rgba(185, 184, 187, 0.16);
-  --stroke-soft: rgba(185, 184, 187, 0.1);
+  --bg: #100818;
+  --bg-deep: #07030f;
+  --panel: rgba(22, 10, 32, 0.8);
+  --panel-strong: rgba(30, 14, 42, 0.9);
+  --card: rgba(24, 11, 36, 0.84);
+  --stroke: rgba(255, 171, 199, 0.16);
+  --stroke-soft: rgba(255, 171, 199, 0.1);
   --text-main: #edf4ff;
   --text-sub: #b5becc;
   --text-muted: #7e8797;
-  --primary: #82d6f6;
-  --primary-soft: #4fa9d8;
-  --accent: var(--gnu-blue);
+  --primary: #ffabc7;
+  --primary-soft: #e86fa3;
+  --accent: #e86fa3;
   --accent-soft: #8ddfff;
   --success: #2fd18b;
   --warning: var(--gnu-bronze);
@@ -71,19 +71,19 @@
 
 @supports (color: oklch(0.7 0.1 220)) {
   :root {
-    --bg: oklch(0.17 0.028 252);
-    --bg-deep: oklch(0.12 0.02 252);
-    --panel: oklch(0.22 0.022 252 / 0.8);
-    --panel-strong: oklch(0.27 0.03 252 / 0.9);
-    --card: oklch(0.23 0.024 252 / 0.84);
-    --stroke: oklch(0.77 0.007 255 / 0.16);
-    --stroke-soft: oklch(0.77 0.007 255 / 0.1);
+    --bg: oklch(0.14 0.03 340);
+    --bg-deep: oklch(0.09 0.02 340);
+    --panel: oklch(0.18 0.028 340 / 0.8);
+    --panel-strong: oklch(0.22 0.032 340 / 0.9);
+    --card: oklch(0.19 0.03 340 / 0.84);
+    --stroke: oklch(0.82 0.06 350 / 0.16);
+    --stroke-soft: oklch(0.82 0.06 350 / 0.1);
     --text-main: oklch(0.96 0.015 250);
     --text-sub: oklch(0.82 0.012 255);
     --text-muted: oklch(0.68 0.01 255);
-    --primary: oklch(0.86 0.07 225);
-    --primary-soft: oklch(0.71 0.08 226);
-    --accent: oklch(0.7 0.1 229);
+    --primary: oklch(0.84 0.1 355);
+    --primary-soft: oklch(0.68 0.14 350);
+    --accent: oklch(0.68 0.14 350);
     --accent-soft: oklch(0.88 0.05 224);
     --success: oklch(0.79 0.14 161);
     --warning: oklch(0.79 0.07 86);
@@ -709,6 +709,64 @@ body::after {
   color: var(--text-sub);
 }
 
+.auth-session-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px;
+}
+
+.auth-session-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.auth-session-title {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.auth-session-name {
+  color: #f7fbff;
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+}
+
+.auth-session-id {
+  color: var(--text-sub);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.auth-logout-button {
+  border: 1px solid rgba(var(--gnu-silver-rgb), 0.16);
+  background: rgba(7, 13, 24, 0.76);
+  color: #f1f6ff;
+  border-radius: 14px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition:
+    transform 0.18s var(--ease-emphasized),
+    border-color 0.18s var(--ease-smooth),
+    background 0.18s var(--ease-smooth);
+}
+
+.auth-logout-button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(var(--gnu-blue-rgb), 0.28);
+  background: rgba(9, 19, 34, 0.92);
+}
+
 .mode-toggle {
   display: inline-flex;
   gap: 6px;
@@ -1124,8 +1182,8 @@ body::after {
 .risk-safe {
   background: linear-gradient(
     145deg,
-    rgba(var(--gnu-grey-rgb), 0.94),
-    rgba(var(--gnu-blue-rgb), 0.9)
+    rgba(89, 97, 104, 0.94),
+    rgba(24, 151, 209, 0.9)
   );
 }
 
@@ -1133,22 +1191,22 @@ body::after {
   background: linear-gradient(
     145deg,
     rgba(23, 61, 104, 0.96),
-    rgba(var(--gnu-blue-rgb), 0.88)
+    rgba(24, 151, 209, 0.88)
   );
 }
 
 .risk-warning {
   background: linear-gradient(
     145deg,
-    rgba(var(--gnu-bronze-rgb), 0.36),
-    rgba(var(--gnu-bronze-rgb), 0.88)
+    rgba(197, 180, 123, 0.36),
+    rgba(197, 180, 123, 0.88)
   );
 }
 
 .risk-high {
   background: linear-gradient(
     145deg,
-    rgba(var(--gnu-grey-rgb), 0.95),
+    rgba(89, 97, 104, 0.95),
     rgba(150, 116, 76, 0.92)
   );
 }
@@ -1421,7 +1479,8 @@ body::after {
 
 .workspace {
   flex: 1 1 auto;
-  min-height: 0;
+  min-height: calc(100vh - 36px);
+  height: auto;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(408px, var(--right-panel-width));
   gap: var(--workspace-gap);
@@ -1451,6 +1510,8 @@ body::after {
   top: 18px;
   align-self: start;
   overflow: hidden;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
 .analysis-side {
@@ -1594,6 +1655,8 @@ body.is-docs-capture .chat-container {
 .chat-container {
   flex: 1 1 auto;
   min-height: 0;
+  height: 100%;
+  max-height: 100%;
   width: 100%;
   border-radius: var(--radius-xl);
   position: relative;
@@ -2326,7 +2389,8 @@ body.is-docs-capture .chat-container {
   flex: 1 1 auto;
   position: relative;
   z-index: 2;
-  min-height: 320px;
+  min-height: 0;
+  height: 100%;
   overflow-y: auto;
   padding: 20px;
   background: linear-gradient(

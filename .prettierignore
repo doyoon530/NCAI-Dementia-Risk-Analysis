@@ -2,6 +2,16 @@ models
 uploads
 __pycache__
 node_modules
+frontend/*/node_modules
+frontend/*/dist
+static/login
+static/team
+static/admin
+static/images/admin
 static/*.local.js
 scripts/*.local.mjs
 templates/admin_visitors.html
+templates/admin*.html
+.githooks
+local
+scripts/build-admin.mjs

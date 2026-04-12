@@ -1,5 +1,6 @@
 import random
 import uuid
+from collections import deque
 from datetime import datetime
 
 from flask import jsonify, request
@@ -16,6 +17,29 @@ from .config import (
     normalize_llm_provider,
 )
 
+NO_PREVIOUS_CONTEXT = "이전 대화 없음"
+RECALL_RESULT_NONE = "없음"
+RECALL_RESULT_CORRECT = "정답"
+RECALL_RESULT_INCORRECT = "오답"
+JUDGMENT_UNCERTAIN = "판단 어려움"
+JUDGMENT_NORMAL = "정상"
+JUDGMENT_SUSPECTED = "의심"
+RISK_EXCLUDED = "반영 제외"
+TREND_INSUFFICIENT = "데이터 부족"
+TREND_STABLE = "안정"
+TREND_UP = "상승"
+TREND_DOWN = "하락"
+
+
+def build_default_recall_state() -> dict:
+    return {
+        "status": "idle",
+        "target_word": "",
+        "prompt": "",
+        "last_result": RECALL_RESULT_NONE,
+        "introduced_turn": 0,
+    }
+
 
 def get_or_create_session_id() -> str:
     session_id = request.headers.get("X-Session-Id") or request.args.get("session_id")
@@ -23,21 +47,21 @@ def get_or_create_session_id() -> str:
     if not session_id:
         session_id = str(uuid.uuid4())
 
-    runtime.conversation_store.setdefault(session_id, [])
-    runtime.score_store.setdefault(session_id, [])
-    runtime.turn_store.setdefault(session_id, [])
+    runtime.conversation_store.setdefault(session_id, deque(maxlen=MAX_HISTORY_TURNS * 2))
+    runtime.score_store.setdefault(session_id, deque(maxlen=MAX_SCORE_HISTORY))
+    runtime.turn_store.setdefault(session_id, deque(maxlen=MAX_SCORE_HISTORY))
     runtime.session_generation_store.setdefault(session_id, 0)
-    runtime.recall_store.setdefault(
-        session_id,
-        {
-            "status": "idle",
-            "target_word": "",
-            "prompt": "",
-            "last_result": "없음",
-            "introduced_turn": 0,
-        },
-    )
+    runtime.recall_store.setdefault(session_id, build_default_recall_state())
     return session_id
+
+
+def reset_session(session_id: str) -> None:
+    runtime.conversation_store[session_id] = deque(maxlen=MAX_HISTORY_TURNS * 2)
+    runtime.score_store[session_id] = deque(maxlen=MAX_SCORE_HISTORY)
+    runtime.turn_store[session_id] = deque(maxlen=MAX_SCORE_HISTORY)
+    runtime.analysis_runtime_cache.pop(session_id, None)
+    runtime.repair_cache.pop(session_id, None)
+    runtime.recall_store[session_id] = build_default_recall_state()
 
 
 def normalize_analysis_generation(value) -> int:
@@ -92,14 +116,9 @@ def is_current_analysis_generation(
 
 
 def add_to_history(session_id: str, role: str, content: str) -> None:
-    runtime.conversation_store.setdefault(session_id, [])
+    if session_id not in runtime.conversation_store:
+        runtime.conversation_store[session_id] = deque(maxlen=MAX_HISTORY_TURNS * 2)
     runtime.conversation_store[session_id].append({"role": role, "content": content})
-
-    max_messages = MAX_HISTORY_TURNS * 2
-    if len(runtime.conversation_store[session_id]) > max_messages:
-        runtime.conversation_store[session_id] = runtime.conversation_store[session_id][
-            -max_messages:
-        ]
 
 
 def build_analysis_context_from_turns(
@@ -108,7 +127,7 @@ def build_analysis_context_from_turns(
     if not turns:
         return "이전 대화 없음"
 
-    recent_turns = turns[-max_turns:]
+    recent_turns = list(turns)[-max_turns:]
     context_lines = []
 
     for index, turn in enumerate(recent_turns, start=1):
@@ -162,7 +181,7 @@ def get_analysis_runtime_state(session_id: str | None) -> dict:
             "turn_count": 0,
         }
 
-    turns = runtime.turn_store.get(session_id, [])
+    turns = list(runtime.turn_store.get(session_id, []))
     turn_count = len(turns)
     cached = runtime.analysis_runtime_cache.get(session_id)
     if cached and cached.get("turn_count") == turn_count:
@@ -190,7 +209,8 @@ def add_turn_history(
     excluded_reason: str = "",
     llm_provider: str = "local",
 ) -> dict:
-    runtime.turn_store.setdefault(session_id, [])
+    if session_id not in runtime.turn_store:
+        runtime.turn_store[session_id] = deque(maxlen=MAX_SCORE_HISTORY)
 
     turn = {
         "turn_id": str(uuid.uuid4()),
@@ -213,11 +233,8 @@ def add_turn_history(
     }
 
     runtime.turn_store[session_id].append(turn)
-    if len(runtime.turn_store[session_id]) > MAX_SCORE_HISTORY:
-        runtime.turn_store[session_id] = runtime.turn_store[session_id][
-            -MAX_SCORE_HISTORY:
-        ]
-
+    # Invalidate repair cache — a new turn means next repair must re-run from scratch
+    runtime.repair_cache.pop(session_id, None)
     turn["average_score"] = get_average_score(session_id)
     turn["recent_average_score"] = get_recent_average_score(session_id)
 
@@ -228,8 +245,8 @@ def add_turn_history(
             turn["feature_scores"], turn["score"]
         )
     else:
-        turn["risk_level"] = "반영 제외"
-        turn["trend"] = "반영 제외"
+        turn["risk_level"] = RISK_EXCLUDED
+        turn["trend"] = RISK_EXCLUDED
         turn["confidence"] = 0
 
     return turn
@@ -237,18 +254,18 @@ def add_turn_history(
 
 def calculate_trend_from_score_values(scores, window: int = RECENT_WINDOW) -> str:
     if len(scores) < 2:
-        return "데이터 부족"
+        return TREND_INSUFFICIENT
 
     recent = scores[-window:]
     if len(recent) < 2:
-        return "안정"
+        return TREND_STABLE
 
     diff = recent[-1] - recent[0]
     if diff >= 10:
-        return "상승"
+        return TREND_UP
     if diff <= -10:
-        return "하락"
-    return "안정"
+        return TREND_DOWN
+    return TREND_STABLE
 
 
 def repair_session_analysis_history(session_id: str) -> None:
@@ -260,6 +277,12 @@ def repair_session_analysis_history(session_id: str) -> None:
 
     turns = runtime.turn_store.get(session_id, [])
     if not turns:
+        return
+
+    turn_count = len(turns)
+    # Skip the O(n) repair if it already ran for this exact turn count.
+    # repair is called 3+ times per add_turn_history (average, recent_avg, trend).
+    if runtime.repair_cache.get(session_id) == turn_count:
         return
 
     existing_scores = runtime.score_store.get(session_id, [])
@@ -339,8 +362,8 @@ def repair_session_analysis_history(session_id: str) -> None:
             turn["trend"] = calculate_trend_from_score_values(running_scores)
         else:
             turn["confidence"] = 0
-            turn["risk_level"] = "반영 제외"
-            turn["trend"] = "반영 제외"
+            turn["risk_level"] = RISK_EXCLUDED
+            turn["trend"] = RISK_EXCLUDED
 
         if running_scores:
             turn["average_score"] = round(sum(running_scores) / len(running_scores), 1)
@@ -366,12 +389,13 @@ def repair_session_analysis_history(session_id: str) -> None:
             {"score": clamp_score(int(turn.get("score", 0))), "time": time_value}
         )
 
-    runtime.score_store[session_id] = repaired_score_history[-MAX_SCORE_HISTORY:]
+    runtime.score_store[session_id] = deque(repaired_score_history[-MAX_SCORE_HISTORY:], maxlen=MAX_SCORE_HISTORY)
+    runtime.repair_cache[session_id] = turn_count
 
 
 def get_turn_history(session_id: str):
     repair_session_analysis_history(session_id)
-    return runtime.turn_store.get(session_id, [])
+    return list(runtime.turn_store.get(session_id, []))
 
 
 def get_user_turn_count(session_id: str) -> int:
@@ -380,20 +404,16 @@ def get_user_turn_count(session_id: str) -> int:
 
 
 def add_score_history(session_id: str, score: int) -> None:
-    runtime.score_store.setdefault(session_id, [])
+    if session_id not in runtime.score_store:
+        runtime.score_store[session_id] = deque(maxlen=MAX_SCORE_HISTORY)
     runtime.score_store[session_id].append(
         {"score": clamp_score(score), "time": datetime.now().strftime("%H:%M:%S")}
     )
 
-    if len(runtime.score_store[session_id]) > MAX_SCORE_HISTORY:
-        runtime.score_store[session_id] = runtime.score_store[session_id][
-            -MAX_SCORE_HISTORY:
-        ]
-
 
 def get_score_history(session_id: str):
     repair_session_analysis_history(session_id)
-    return runtime.score_store.get(session_id, [])
+    return list(runtime.score_store.get(session_id, []))
 
 
 def get_average_score(session_id: str) -> float:
@@ -457,7 +477,7 @@ def should_include_analysis_score(
     normalized_score = clamp_score(int(score or 0))
 
     if (
-        normalized_judgment == "판단 어려움"
+        normalized_judgment == JUDGMENT_UNCERTAIN
         and normalized_score == 0
         and not has_meaningful_feature_scores(feature_scores)
     ):
@@ -505,16 +525,7 @@ def get_score_trend(session_id: str, window: int = RECENT_WINDOW) -> str:
 
 
 def get_recall_state(session_id: str) -> dict:
-    return runtime.recall_store.setdefault(
-        session_id,
-        {
-            "status": "idle",
-            "target_word": "",
-            "prompt": "",
-            "last_result": "없음",
-            "introduced_turn": 0,
-        },
-    )
+    return runtime.recall_store.setdefault(session_id, build_default_recall_state())
 
 
 def evaluate_recall_answer(session_id: str, user_input: str) -> str:
@@ -527,10 +538,10 @@ def evaluate_recall_answer(session_id: str, user_input: str) -> str:
 
     if target_word and target_word in normalized_input:
         feedback = f"Recall Test 결과: 정답입니다. 기억 단어는 '{target_word}'였습니다."
-        state["last_result"] = "정답"
+        state["last_result"] = RECALL_RESULT_CORRECT
     else:
         feedback = f"Recall Test 결과: 오답입니다. 기억 단어는 '{target_word}'였습니다."
-        state["last_result"] = "오답"
+        state["last_result"] = RECALL_RESULT_INCORRECT
 
     state["status"] = "idle"
     state["prompt"] = ""
@@ -590,9 +601,7 @@ def build_chat_response(
     excluded_reason: str = "",
     llm_provider: str = "local",
 ):
-    recent_average_score = get_recent_average_score(session_id)
-    risk_level = get_risk_level_from_score(recent_average_score)
-    trend = get_score_trend(session_id)
+    metrics = build_analysis_metrics_payload(session_id)
 
     return jsonify(
         {
@@ -609,15 +618,103 @@ def build_chat_response(
             "llm_provider": normalize_llm_provider(llm_provider),
             "score_included": bool(score_included),
             "excluded_reason": str(excluded_reason or ""),
-            "average_score": get_average_score(session_id),
-            "recent_average_score": recent_average_score,
-            "risk_level": risk_level,
-            "trend": trend,
-            "score_history": get_score_history(session_id),
-            "turn_history": get_turn_history(session_id),
+            "average_score": metrics["average_score"],
+            "recent_average_score": metrics["recent_average_score"],
+            "risk_level": metrics["risk_level"],
+            "trend": metrics["trend"],
+            # Incremental: send only the newest score entry instead of the full array.
+            # The full arrays are served by GET /score-history (page load).
+            # The frontend appends new_score_entry to its local scoreHistory,
+            # and already has incremental turn-merge logic for data.turn.
+            "new_score_entry": (
+                {"score": clamp_score(turn["score"]), "time": turn.get("time", "")}
+                if score_included and turn is not None
+                else None
+            ),
             "turn": turn,
-            "recall": serialize_recall_state(session_id),
+            "recall": metrics["recall"],
         }
+    )
+
+
+def build_analysis_metrics_payload(session_id: str) -> dict:
+    recent_average_score = get_recent_average_score(session_id)
+    return {
+        "average_score": get_average_score(session_id),
+        "recent_average_score": recent_average_score,
+        "risk_level": get_risk_level_from_score(recent_average_score),
+        "trend": get_score_trend(session_id),
+        "score_history": get_score_history(session_id),
+        "turn_history": get_turn_history(session_id),
+        "recall": serialize_recall_state(session_id),
+    }
+
+
+def build_analysis_detail_payload(
+    session_id: str,
+    *,
+    stt_result: str,
+    answer: str,
+    judgment: str,
+    reason: str,
+    score_total: int,
+    feature_scores: dict,
+    llm_provider: str = "local",
+    turn=None,
+    score_included: bool = True,
+    excluded_reason: str = "",
+) -> dict:
+    metrics = build_analysis_metrics_payload(session_id)
+    return {
+        "session_id": session_id,
+        "analysis_generation": get_analysis_generation(session_id),
+        "stt_result": stt_result,
+        "answer": answer,
+        "judgment": judgment,
+        "reason": reason,
+        "score_total": clamp_score(score_total),
+        "session_score": metrics["average_score"],
+        "recent_session_score": metrics["recent_average_score"],
+        "score_repeat": int(feature_scores.get("repetition", 0)),
+        "score_memory": int(feature_scores.get("memory", 0)),
+        "score_time_confusion": int(feature_scores.get("time_confusion", 0)),
+        "score_incoherence": int(feature_scores.get("incoherence", 0)),
+        "risk_level": metrics["risk_level"],
+        "trend": metrics["trend"],
+        "score_history": metrics["score_history"],
+        "turn_history": metrics["turn_history"],
+        "recall": metrics["recall"],
+        "turn": turn,
+        "llm_provider": normalize_llm_provider(llm_provider),
+        "score_included": bool(score_included),
+        "excluded_reason": str(excluded_reason or ""),
+    }
+
+
+def build_empty_analysis_detail_payload(
+    session_id: str,
+    *,
+    llm_provider: str = "local",
+    reason: str,
+    excluded_reason: str,
+) -> dict:
+    return build_analysis_detail_payload(
+        session_id,
+        stt_result="",
+        answer="",
+        judgment=JUDGMENT_UNCERTAIN,
+        reason=reason,
+        score_total=0,
+        feature_scores={
+            "repetition": 0,
+            "memory": 0,
+            "time_confusion": 0,
+            "incoherence": 0,
+        },
+        llm_provider=llm_provider,
+        turn=None,
+        score_included=False,
+        excluded_reason=excluded_reason,
     )
 
 

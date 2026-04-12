@@ -1,5 +1,6 @@
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from difflib import SequenceMatcher
 
@@ -8,6 +9,7 @@ from .common import clamp_score, clamp_subscore, normalize_text, validate_user_t
 from .config import (
     ANSWER_STOP_SEQUENCES,
     MAX_ANALYSIS_RETRY,
+    REPETITION_HEURISTIC_SKIP_THRESHOLD,
     REPETITION_SCORE_OPTIONS,
     ROLE_ANALYSIS_META,
     ROLE_ANALYSIS_ORDER,
@@ -333,13 +335,6 @@ def get_analysis_fallback_text() -> str:
     )
 
 
-def get_feature_analysis_fallback_text() -> str:
-    return (
-        "기억혼란점수: 0\n"
-        "시간혼란점수: 0\n"
-        "문장비논리점수: 0\n"
-        f"근거: {get_default_reason()}"
-    )
 
 
 def split_sentences(text: str):
@@ -697,96 +692,6 @@ def extract_analysis_fields(response_text: str) -> dict:
     }
 
 
-def parse_feature_analysis_scores(text: str) -> dict:
-    parsed = parse_analysis_scores(text)
-    return {
-        "memory": parsed["memory"],
-        "time_confusion": parsed["time_confusion"],
-        "incoherence": parsed["incoherence"],
-    }
-
-
-def is_feature_analysis_complete(text: str) -> bool:
-    if not text or not text.strip():
-        return False
-
-    required_patterns = [
-        r"기억혼란점수:\s*(\d+)",
-        r"시간혼란점수:\s*(\d+)",
-        r"문장비논리점수:\s*(\d+)",
-        r"근거:\s*(.+)",
-    ]
-
-    for pattern in required_patterns:
-        if not re.search(pattern, text, re.DOTALL):
-            return False
-
-    reason_match = re.search(r"근거:\s*(.+)", text, re.DOTALL)
-    reason = reason_match.group(1).strip() if reason_match else ""
-
-    if is_invalid_reason_text(reason):
-        return False
-
-    if len(split_sentences(reason)) < 2:
-        return False
-
-    return True
-
-
-def force_feature_analysis_format(raw_text: str) -> str:
-    if not raw_text or not raw_text.strip():
-        return get_feature_analysis_fallback_text()
-
-    cleaned = raw_text.strip()
-    scores = parse_feature_analysis_scores(cleaned)
-    reason_match = re.search(r"근거:\s*(.+)", cleaned, re.DOTALL)
-    reason_text = reason_match.group(1).strip() if reason_match else ""
-
-    scores_for_reason = {
-        "repetition": 0,
-        "memory": scores["memory"],
-        "time_confusion": scores["time_confusion"],
-        "incoherence": scores["incoherence"],
-    }
-    reason_text = normalize_reason_text(reason_text, scores_for_reason)
-
-    return (
-        f"기억혼란점수: {scores['memory']}\n"
-        f"시간혼란점수: {scores['time_confusion']}\n"
-        f"문장비논리점수: {scores['incoherence']}\n"
-        f"근거: {reason_text}"
-    )
-
-
-def extract_feature_analysis_fields(response_text: str) -> dict:
-    if not response_text:
-        return {
-            "reason": get_default_reason(),
-            "feature_scores": {
-                "repetition": 0,
-                "memory": 0,
-                "time_confusion": 0,
-                "incoherence": 0,
-            },
-        }
-
-    parsed = parse_feature_analysis_scores(response_text)
-    reason_match = re.search(r"근거:\s*(.+)", response_text, re.DOTALL)
-    scores_for_reason = {
-        "repetition": 0,
-        "memory": parsed["memory"],
-        "time_confusion": parsed["time_confusion"],
-        "incoherence": parsed["incoherence"],
-    }
-    reason = reason_match.group(1).strip() if reason_match else get_default_reason()
-    reason = normalize_reason_text(reason, scores_for_reason)
-
-    return {
-        "reason": reason,
-        "feature_scores": scores_for_reason,
-    }
-
-
 def get_role_analysis_fallback_text(role_key: str) -> str:
     meta = ROLE_ANALYSIS_META[role_key]
     return f"{meta['score_label']}: 0\n근거: {get_default_reason()}"
@@ -956,10 +861,7 @@ def generate_repetition_role_analysis(
 ) -> dict:
     question = normalize_text(question)
     normalized_provider = normalize_llm_provider(provider or get_default_llm_provider())
-    if normalized_provider == "api" and not is_api_llm_configured():
-        raise RuntimeError(
-            "API 모드가 아직 설정되지 않았습니다. API 키와 모델 이름을 먼저 설정해주세요."
-        )
+
     if previous_turns is None:
         previous_turns = get_analysis_runtime_state(session_id)["previous_turns"]
 
@@ -969,6 +871,29 @@ def generate_repetition_role_analysis(
             "score": 0,
             "reason": "",
         }
+
+    # --- Heuristic short-circuit ---
+    # Run fast similarity analysis first.  If it already yields a high-confidence
+    # score (>= REPETITION_HEURISTIC_SKIP_THRESHOLD), the match is unambiguous and
+    # calling the LLM adds no value — skip it and return immediately.
+    # This also avoids the API-configured check entirely for obvious repeats.
+    heuristic = analyze_repetition_by_similarity(question, previous_turns)
+    if heuristic["score"] >= REPETITION_HEURISTIC_SKIP_THRESHOLD:
+        logger.debug(
+            "repetition heuristic short-circuit: score=%s (>= %s), skipping LLM",
+            heuristic["score"],
+            REPETITION_HEURISTIC_SKIP_THRESHOLD,
+        )
+        return {
+            "role": "repetition",
+            "score": clamp_subscore(heuristic["score"], 25),
+            "reason": heuristic.get("reason", ""),
+        }
+
+    if normalized_provider == "api" and not is_api_llm_configured():
+        raise RuntimeError(
+            "API 모드가 아직 설정되지 않았습니다. API 키와 모델 이름을 먼저 설정해주세요."
+        )
 
     try:
         if normalized_provider == "api":
@@ -994,15 +919,31 @@ def generate_repetition_role_analysis(
                     }
                 )
         parsed = parse_repetition_chain_response(response.get("text", ""))
+        llm_score = clamp_subscore(int(parsed.get("score", 0)), 25)
+        # Take whichever source (LLM or heuristic) gave a higher score.
+        # Prefer LLM reason when its score is strictly higher; keep heuristic reason otherwise.
+        if llm_score >= heuristic["score"]:
+            return {
+                "role": "repetition",
+                "score": llm_score,
+                "reason": normalize_text(parsed.get("reason", "")),
+            }
         return {
             "role": "repetition",
-            "score": clamp_subscore(int(parsed.get("score", 0)), 25),
-            "reason": normalize_text(parsed.get("reason", "")),
+            "score": heuristic["score"],
+            "reason": heuristic.get("reason", ""),
         }
     except Exception as e:
         logger.warning("repetition 분석 실패: %s", e, exc_info=True)
         if normalized_provider == "api":
             raise RuntimeError("질문 반복 API 분석에 실패했습니다.") from e
+        # Fall back to heuristic result on local-mode error
+        if heuristic["score"] > 0:
+            return {
+                "role": "repetition",
+                "score": heuristic["score"],
+                "reason": heuristic.get("reason", ""),
+            }
         return {
             "role": "repetition",
             "score": 0,
@@ -1275,7 +1216,10 @@ def generate_answer_result(question: str, provider: str | None = None) -> dict:
 
 
 def generate_analysis_result(
-    question: str, session_id: str | None = None, provider: str | None = None
+    question: str,
+    session_id: str | None = None,
+    provider: str | None = None,
+    progress_callback=None,
 ) -> dict:
     question = normalize_text(question)
     normalized_provider = normalize_llm_provider(provider or get_default_llm_provider())
@@ -1294,44 +1238,109 @@ def generate_analysis_result(
         }
 
     runtime_state = get_analysis_runtime_state(session_id)
-    role_results = {
-        "repetition": generate_repetition_role_analysis(
-            question,
-            session_id=session_id,
-            previous_turns=runtime_state["previous_turns"],
-            provider=normalized_provider,
-        ),
-        "memory": generate_single_role_analysis(
-            "memory",
-            question,
-            session_id=session_id,
-            conversation_context=runtime_state["analysis_context"],
-            provider=normalized_provider,
-        ),
-        "time_confusion": generate_single_role_analysis(
-            "time_confusion",
-            question,
-            session_id=session_id,
-            conversation_context=runtime_state["analysis_context"],
-            provider=normalized_provider,
-        ),
-        "incoherence": generate_single_role_analysis(
-            "incoherence",
-            question,
-            session_id=session_id,
-            conversation_context=runtime_state["analysis_context"],
-            provider=normalized_provider,
-        ),
-    }
+
+    if normalized_provider == "api":
+        # API mode: all 4 role analyses are independent HTTP calls — run them in parallel
+        analysis_context = runtime_state["analysis_context"]
+        previous_turns = runtime_state["previous_turns"]
+        role_tasks = {
+            "repetition": lambda: generate_repetition_role_analysis(
+                question,
+                session_id=session_id,
+                previous_turns=previous_turns,
+                provider=normalized_provider,
+            ),
+            "memory": lambda: generate_single_role_analysis(
+                "memory",
+                question,
+                session_id=session_id,
+                conversation_context=analysis_context,
+                provider=normalized_provider,
+            ),
+            "time_confusion": lambda: generate_single_role_analysis(
+                "time_confusion",
+                question,
+                session_id=session_id,
+                conversation_context=analysis_context,
+                provider=normalized_provider,
+            ),
+            "incoherence": lambda: generate_single_role_analysis(
+                "incoherence",
+                question,
+                session_id=session_id,
+                conversation_context=analysis_context,
+                provider=normalized_provider,
+            ),
+        }
+        role_results = {}
+        completed_count = 0
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_role = {executor.submit(fn): role for role, fn in role_tasks.items()}
+            for future in as_completed(future_to_role):
+                role = future_to_role[future]
+                role_results[role] = future.result()  # propagates exceptions naturally
+                completed_count += 1
+                if progress_callback:
+                    progress_callback(
+                        "analysis",
+                        45 + completed_count * 10,
+                        f"분석 중... ({completed_count}/4)",
+                    )
+    else:
+        # Local mode: sequential execution required due to analysis_llm_lock
+        _local_roles = [
+            ("repetition", lambda: generate_repetition_role_analysis(
+                question,
+                session_id=session_id,
+                previous_turns=runtime_state["previous_turns"],
+                provider=normalized_provider,
+            )),
+            ("memory", lambda: generate_single_role_analysis(
+                "memory",
+                question,
+                session_id=session_id,
+                conversation_context=runtime_state["analysis_context"],
+                provider=normalized_provider,
+            )),
+            ("time_confusion", lambda: generate_single_role_analysis(
+                "time_confusion",
+                question,
+                session_id=session_id,
+                conversation_context=runtime_state["analysis_context"],
+                provider=normalized_provider,
+            )),
+            ("incoherence", lambda: generate_single_role_analysis(
+                "incoherence",
+                question,
+                session_id=session_id,
+                conversation_context=runtime_state["analysis_context"],
+                provider=normalized_provider,
+            )),
+        ]
+        role_results = {}
+        for i, (role_name, role_fn) in enumerate(_local_roles):
+            if progress_callback:
+                progress_callback(
+                    "analysis",
+                    45 + i * 10,
+                    f"분석 중... ({i + 1}/4)",
+                )
+            role_results[role_name] = role_fn()
+
     fields = build_fields_from_role_results(role_results)
     fields["llm_provider"] = normalized_provider
     return fields
 
 
 def get_response_from_llama(
-    question: str, session_id: str | None = None, provider: str | None = None
+    question: str,
+    session_id: str | None = None,
+    provider: str | None = None,
+    progress_callback=None,
 ) -> dict:
     normalized_provider = normalize_llm_provider(provider or get_default_llm_provider())
+    if progress_callback:
+        progress_callback("answer", 25, "답변 생성 중...")
     answer_result = generate_answer_result(question, provider=normalized_provider)
 
     if all(
@@ -1341,8 +1350,13 @@ def get_response_from_llama(
         answer_result["llm_provider"] = normalized_provider
         return answer_result
 
+    if progress_callback:
+        progress_callback("analysis", 45, "인지 기능 분석 중...")
     fields = generate_analysis_result(
-        question, session_id=session_id, provider=normalized_provider
+        question,
+        session_id=session_id,
+        provider=normalized_provider,
+        progress_callback=progress_callback,
     )
     full_text = build_full_text(answer_result["answer"], fields)
 
